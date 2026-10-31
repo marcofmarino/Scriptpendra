@@ -1,0 +1,15 @@
+/target
+
+
+*.scriptpendra
+*.datos/
+*.antes-de-carpeta.json
+recuperado.*
+settings.json
+agenda.json
+
+
+.env
+.env.*
+*.pem
+*.key
