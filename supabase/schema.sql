@@ -280,6 +280,8 @@ begin
   if (select count(*) from public.join_attempts a where a.user_id = uid and a.at > now() - interval '10 minutes') >= 10 then
     raise exception 'demasiados intentos' using errcode = '53400';
   end if;
+  -- Los intentos viejos se borran: la tabla no crece sin límite.
+  delete from public.join_attempts a where a.at < now() - interval '1 day';
   insert into public.join_attempts (user_id) values (uid);
   select * into inv from public.invites i
   where i.code_hash = encode(extensions.digest(code, 'sha256'), 'hex')
@@ -327,6 +329,10 @@ begin
   select s.version into current_version from public.sections s where s.project_id = pid and s.name = section for update;
   if not found then
     if base_version <> 0 then raise exception 'conflicto' using errcode = '40001'; end if;
+    -- Tope de secciones por proyecto (el programa usa 12): sin esto, una cuenta podría llenar la base con nombres inventados.
+    if (select count(*) from public.sections s where s.project_id = pid) >= 20 then
+      raise exception 'demasiadas secciones' using errcode = '53400';
+    end if;
     insert into public.sections (project_id, name, content, version, updated_by)
     values (pid, section, new_content, 1, auth.uid());
     return 1;

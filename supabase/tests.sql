@@ -1,4 +1,3 @@
-
 -- Scriptpendra · pruebas de las políticas de seguridad
 --
 -- Se pega en el SQL Editor de Supabase DESPUÉS de `schema.sql` y se ejecuta. Crea dos usuarios y dos grupos de prueba, intenta
@@ -138,6 +137,13 @@ begin
   perform pg_temp.must_fail('nombre de sección inválido', format('select public.push_section(%L, ''../guion'', 0, ''{}'')', pa), 'inválida');
   perform pg_temp.must_fail('contenido demasiado grande',
     format('select public.push_section(%L, ''plantas'', 0, repeat(''x'', 5300000))', pa), 'demasiado grande');
+
+  -- Un proyecto no puede tener secciones sin límite.
+  for i in 1..19 loop
+    perform public.push_section(pa, 'sec' || chr(96 + i), 0, '{}');
+  end loop;
+  perform pg_temp.must_fail('más de 20 secciones en un proyecto',
+    format('select public.push_section(%L, ''secz'', 0, ''{}'')', pa), 'demasiadas');
 
   -- Imágenes: tipo, tamaño, cuota, repetidas y ritmo.
   r := public.reserve_image(pa, repeat('a', 64), 'png', 1000);
