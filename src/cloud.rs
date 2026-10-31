@@ -167,6 +167,58 @@ pub fn is_image_ext(s: &str) -> bool {
     matches!(s, "jpg" | "png" | "webp")
 }
 
+/// Decodifica base64url sin relleno (lo que usan las partes de un JWT). `None` si no es válido.
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut buffer, mut bits) = (0u32, 0u32);
+    for c in text.trim_end_matches('=').bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Comprueba que lo que se pegó es una clave PÚBLICA de Supabase y no una secreta. Devuelve si es del formato nuevo
+/// (`sb_publishable_…`). Se rechazan las claves secretas (`sb_secret_…`, o un JWT con rol `service_role`): una clave así dentro
+/// del programa daría acceso total a la base a cualquiera que lo tenga.
+pub fn check_public_key(key: &str) -> Result<bool, String> {
+    let secret = "Esa es una clave secreta: no la pegues en el programa. Usá la clave pública («anon» o «publishable»).";
+    if key.starts_with("sb_secret_") {
+        return Err(secret.into());
+    }
+    if let Some(rest) = key.strip_prefix("sb_publishable_") {
+        let ok = (16..=200).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+        return if ok { Ok(true) } else { Err("La clave pública no tiene el formato esperado.".into()) };
+    }
+    let shape_ok = key.len() >= 20
+        && key.len() <= 4096
+        && key.split('.').count() == 3
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '='));
+    if !shape_ok {
+        return Err("La clave pública no tiene el formato esperado.".into());
+    }
+    // Un JWT: se mira el rol que declara. Solo vale `anon`.
+    let payload = key.split('.').nth(1).and_then(base64url_decode).and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    match payload.as_ref().and_then(|p| p.get("role")).and_then(Value::as_str) {
+        Some("anon") => Ok(false),
+        Some("service_role") => Err(secret.into()),
+        _ => Err("Esa clave no es la clave pública (anon).".into()),
+    }
+}
+
 /// Un mail razonable: lo justo para no mandar basura al servidor (el servidor lo valida de verdad).
 pub fn is_email_shape(s: &str) -> bool {
     let s = s.trim();
@@ -368,6 +420,8 @@ pub enum SignUp {
 
 pub struct Client<T: Transport> {
     anon_key: String,
+    /// La clave es del formato nuevo (`sb_publishable_…`), que no es un JWT y no va en la cabecera `Authorization`.
+    publishable: bool,
     url: String,
     transport: T,
     session: Option<Session>,
@@ -386,16 +440,8 @@ impl Client<HttpsTransport> {
 impl<T: Transport> Client<T> {
     pub fn new(url: String, anon_key: &str, transport: T) -> Result<Self, String> {
         let key = anon_key.trim();
-        // La clave pública es un JWT: tres partes en base64url. Se rechaza lo que no tenga esa forma (por ejemplo una clave
-        // pegada con espacios o con otro texto).
-        let shape_ok = key.len() >= 20
-            && key.len() <= 4096
-            && key.split('.').count() == 3
-            && key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '='));
-        if !shape_ok {
-            return Err("La clave pública no tiene el formato esperado.".into());
-        }
-        Ok(Self { anon_key: key.to_string(), url, transport, session: None })
+        let publishable = check_public_key(key)?;
+        Ok(Self { anon_key: key.to_string(), publishable, url, transport, session: None })
     }
 
     pub fn url(&self) -> &str {
@@ -407,22 +453,16 @@ impl<T: Transport> Client<T> {
     }
 
     fn request(&self, method: Method, path: &str, query: Vec<(String, String)>, body: Vec<u8>, max: usize) -> Request {
-        let bearer = self
-            .session
-            .as_ref()
-            .filter(|s| !s.access_token.is_empty())
-            .map_or(self.anon_key.as_str(), |s| s.access_token.as_str());
-        Request {
-            method,
-            path: path.to_string(),
-            query,
-            headers: vec![
-                ("apikey".into(), self.anon_key.clone()),
-                ("Authorization".into(), format!("Bearer {bearer}")),
-            ],
-            body,
-            max_response: max,
+        let token = self.session.as_ref().filter(|s| !s.access_token.is_empty()).map(|s| s.access_token.as_str());
+        let mut headers = vec![("apikey".to_string(), self.anon_key.clone())];
+        // Con la sesión iniciada va el token de la persona. Sin sesión, la clave pública de formato JWT (la nueva, `sb_publishable_`,
+        // no es un JWT y viaja solo en `apikey`).
+        match (token, self.publishable) {
+            (Some(t), _) => headers.push(("Authorization".into(), format!("Bearer {t}"))),
+            (None, false) => headers.push(("Authorization".into(), format!("Bearer {}", self.anon_key))),
+            (None, true) => {}
         }
+        Request { method, path: path.to_string(), query, headers, body, max_response: max }
     }
 
     fn send_json(&self, request: Request) -> Result<Value, CloudError> {
@@ -1008,6 +1048,27 @@ mod tests {
         assert!(Client::new("https://a.b.co".into(), "no es una clave", Fake::default()).is_err());
         assert!(Client::new("https://a.b.co".into(), "a.b", Fake::default()).is_err());
         assert!(Client::new("https://a.b.co".into(), KEY, Fake::default()).is_ok());
+    }
+
+    #[test]
+    fn a_secret_key_is_refused_and_the_new_publishable_format_travels_only_in_apikey() {
+        // JWT con rol service_role: {"role":"service_role"}
+        let service = "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.firmafirmafirmafirma";
+        assert!(check_public_key(service).unwrap_err().contains("secreta"));
+        assert!(check_public_key("sb_secret_abcdefghijklmnopqrstuvwxyz").unwrap_err().contains("secreta"));
+        // Otro rol cualquiera tampoco.
+        assert!(check_public_key("eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYWRtaW4ifQ.firmafirmafirmafirma").is_err());
+        assert_eq!(check_public_key(KEY), Ok(false));
+        let publishable = "sb_publishable_AbCdEfGhIjKlMnOpQrStUv_123";
+        assert_eq!(check_public_key(publishable), Ok(true));
+        assert!(check_public_key("sb_publishable_corta").is_err());
+        let fake = Fake::default();
+        let mut c = Client::new("https://abc.supabase.co".into(), publishable, fake.clone()).unwrap();
+        fake.reply(200, r#"{"x":1}"#);
+        let _ = c.sign_up("a@b.co", "una-clave-larga");
+        let seen = fake.seen.lock().unwrap().clone();
+        assert!(seen[0].headers.iter().any(|(k, v)| k == "apikey" && v == publishable));
+        assert!(!seen[0].headers.iter().any(|(k, _)| k == "Authorization"), "la clave nueva no va como Authorization");
     }
 
     #[test]

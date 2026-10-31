@@ -435,7 +435,7 @@ impl CloudUi {
             kit::DialogWidth::Normal,
             |ui| {
                 if !configured {
-                    ui.label("Pegá la dirección y la clave pública de la nube que te pasaron. La clave pública es la «anon»; nunca pegues una clave «service_role».");
+                    ui.label("Pegá la dirección y la clave pública de la nube que te pasaron (la «anon» o «publishable»). Nunca pegues una clave secreta: el programa la rechaza.");
                     ui.add(egui::TextEdit::singleline(&mut config_url).hint_text("https://xxxx.supabase.co").desired_width(f32::INFINITY));
                     ui.add(egui::TextEdit::singleline(&mut config_key).hint_text("Clave pública (anon)").desired_width(f32::INFINITY));
                     let ok = cloud::parse_url(&config_url).is_ok() && !config_key.trim().is_empty();

@@ -11,7 +11,9 @@
    longitud mínima de contraseña en 10 (el programa ya la pide al crear la cuenta).
 5. Registrarte desde el programa y después, en el SQL Editor:
    `insert into public.admins (user_id) select id from auth.users where email = 'tu-mail@ejemplo.com';`
-6. **Project Settings → API**: copiar la **URL** y la clave **anon**. Esas dos se las pasás a los grupos (se pegan en el
+6. **Project Settings → API Keys**: copiar la **Project URL** (algo como `https://xxxx.supabase.co`) y la clave pública: la
+   **Publishable key** (empieza con `sb_publishable_`) o, en la pestaña de claves anteriores (*Legacy*), la **anon public**.
+   El programa rechaza las claves secretas (`sb_secret_…` o `service_role`) para que no se peguen por error. Esas dos se las pasás a los grupos (se pegan en el
    programa: ☰ → Nube…). **La clave `service_role` es secreta: no se comparte ni se pega en el programa.**
 
 ## Administrar el espacio de imágenes
