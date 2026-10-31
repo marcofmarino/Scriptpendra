@@ -1,10 +1,11 @@
+
 -- Scriptpendra · pruebas de las políticas de seguridad
 --
 -- Se pega en el SQL Editor de Supabase DESPUÉS de `schema.sql` y se ejecuta. Crea dos usuarios y dos grupos de prueba, intenta
 -- cosas que NO deberían poder hacerse y comprueba que fallan, y al final deshace todo (ROLLBACK): no deja nada en la base.
 --
--- Si todo está bien, termina con el aviso «TODAS LAS PRUEBAS PASARON». Si algo falla, se corta con un error que dice cuál
--- prueba fue; en ese caso NO usar la base con otras personas hasta corregirlo.
+-- Si todo está bien, en la tabla de resultados aparece una fila con «TODAS LAS PRUEBAS PASARON». Si algo falla, se corta con un
+-- error rojo que dice «FALLÓ» y cuál prueba fue; en ese caso NO usar la base con otras personas hasta corregirlo.
 
 begin;
 
@@ -178,3 +179,7 @@ end $$;
 reset role;
 do $$ begin raise notice 'TODAS LAS PRUEBAS PASARON'; end $$;
 rollback;
+
+-- Esta última consulta solo se llega a ejecutar si ninguna prueba falló (si una falla, el script se corta antes con un error que
+-- empieza con «FALLÓ»). Es lo que se ve en la tabla de resultados del SQL Editor.
+select 'TODAS LAS PRUEBAS PASARON' as resultado;
