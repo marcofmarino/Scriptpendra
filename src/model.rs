@@ -2630,6 +2630,17 @@ impl Project {
 
     /// Asigna ids a los párrafos que no tengan (proyectos antiguos) y garantiza al menos uno.
     pub fn normalize(&mut self) {
+        self.normalize_with(true);
+    }
+
+    /// Lo mismo para un proyecto que llegó de otra persona (la sincronización): vincula lo que ya tiene ficha, pero no crea
+    /// fichas nuevas. Quien está escribiendo un personaje o una locación todavía no terminó de escribir el nombre («San» camino
+    /// a «Sandía»); la ficha la crea esa persona al soltar el foco, y llega después con la sincronización.
+    pub fn normalize_incoming(&mut self) {
+        self.normalize_with(false);
+    }
+
+    fn normalize_with(&mut self, create_missing: bool) {
         // Los datos de una escena que ya no está en el guion se pierden, salvo su número si estaba fijo (queda omitida).
         let alive: std::collections::HashSet<u64> = self
             .paragraphs
@@ -2790,7 +2801,7 @@ impl Project {
                 CategorySource::Custom => None,
             };
         }
-        self.auto_link_all();
+        self.auto_link_all_with(create_missing);
         self.sync_links();
         self.purge_breakdown_items();
     }
@@ -3202,6 +3213,11 @@ impl Project {
     /// Vincula lo que haya sin vincular en un párrafo: el encabezado de personaje (creando la ficha si falta) y
     /// los nombres que coinciden exactamente con un solo personaje, objeto, elemento o mundo.
     pub fn auto_link_paragraph(&mut self, idx: usize) {
+        self.auto_link_paragraph_with(idx, true);
+    }
+
+    /// Como `auto_link_paragraph`; con `create_missing` en falso no crea fichas nuevas, solo vincula las que ya existen.
+    fn auto_link_paragraph_with(&mut self, idx: usize, create_missing: bool) {
         let kind = self.paragraphs[idx].kind;
         match kind {
             ParagraphKind::Character => {
@@ -3220,7 +3236,8 @@ impl Project {
                     .map(|c| c.id)
                     .collect();
                 let id = match owners.len() {
-                    0 => self.new_character(&name),
+                    0 if create_missing => self.new_character(&name),
+                    0 => return,
                     1 => owners[0],
                     _ => return, // dos con el mismo nombre: hay que elegir cuál
                 };
@@ -3253,7 +3270,8 @@ impl Project {
                     .map(|l| l.id)
                     .collect();
                 let id = match owners.len() {
-                    0 => self.new_location(&name),
+                    0 if create_missing => self.new_location(&name),
+                    0 => return,
                     1 => owners[0],
                     _ => return, // dos locaciones con el mismo nombre: hay que elegir cuál
                 };
@@ -3322,12 +3340,16 @@ impl Project {
     }
 
     pub fn auto_link_all(&mut self) {
+        self.auto_link_all_with(true);
+    }
+
+    fn auto_link_all_with(&mut self, create_missing: bool) {
         for i in 0..self.paragraphs.len() {
             if matches!(
                 self.paragraphs[i].kind,
                 ParagraphKind::Character | ParagraphKind::SceneHeading
             ) {
-                self.auto_link_paragraph(i);
+                self.auto_link_paragraph_with(i, create_missing);
             }
         }
         for i in 0..self.paragraphs.len() {
@@ -3335,7 +3357,7 @@ impl Project {
                 self.paragraphs[i].kind,
                 ParagraphKind::Action | ParagraphKind::Dialogue
             ) {
-                self.auto_link_paragraph(i);
+                self.auto_link_paragraph_with(i, create_missing);
             }
         }
         self.auto_link_treatment();
@@ -6340,6 +6362,13 @@ impl Project {
     /// Cada párrafo con el texto que se ve y se exporta: en la acción y el diálogo, los nombres según las reglas de
     /// mayúsculas; en el resto, el texto tal cual.
     pub fn shown_paragraphs(&self) -> Vec<(ParagraphKind, String)> {
+        self.shown_paragraphs_marked().into_iter().map(|(kind, text, _)| (kind, text)).collect()
+    }
+
+    /// Lo mismo que `shown_paragraphs`, y por cada carácter si va en negrita al elegir «nombres de personajes en negrita»:
+    /// los personajes nombrados dentro de una acción (el nombre del personaje que habla se resuelve aparte). Los párrafos que
+    /// no son acciones traen la lista vacía.
+    pub fn shown_paragraphs_marked(&self) -> Vec<(ParagraphKind, String, Vec<bool>)> {
         let mentions = self.mention_names();
         let case = self.case_options();
         // Dentro de un diálogo los nombres nunca van todo en mayúsculas: es lo que dice el personaje, no una indicación.
@@ -6347,17 +6376,13 @@ impl Project {
         self.paragraphs
             .iter()
             .map(|p| {
-                let text = if matches!(p.kind, ParagraphKind::Action | ParagraphKind::Dialogue) {
-                    let rules = if p.kind == ParagraphKind::Dialogue {
-                        &spoken
-                    } else {
-                        &case
-                    };
-                    styled_mentions_text(&p.text, &p.links, &mentions, rules)
+                if matches!(p.kind, ParagraphKind::Action | ParagraphKind::Dialogue) {
+                    let rules = if p.kind == ParagraphKind::Dialogue { &spoken } else { &case };
+                    let (text, bold) = styled_mentions_marked(&p.text, &p.links, &mentions, rules);
+                    (p.kind, text, if p.kind == ParagraphKind::Action { bold } else { Vec::new() })
                 } else {
-                    p.text.trim_end().to_string()
-                };
-                (p.kind, text)
+                    (p.kind, p.text.trim_end().to_string(), Vec::new())
+                }
             })
             .collect()
     }
@@ -6724,19 +6749,34 @@ pub fn styled_mentions_text(
     mentions: &[Mention],
     case: &CaseOptions,
 ) -> String {
+    styled_mentions_marked(text, links, mentions, case).0
+}
+
+/// El texto de `styled_mentions_text` y, por cada carácter, si pertenece al nombre de un personaje.
+pub fn styled_mentions_marked(
+    text: &str,
+    links: &[Link],
+    mentions: &[Mention],
+    case: &CaseOptions,
+) -> (String, Vec<bool>) {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
+    let mut bold = Vec::with_capacity(chars.len());
     let mut at = 0;
     for span in mention_spans(text, links, mentions, case) {
         out.extend(&chars[at..span.start]);
-        match span.rule {
-            Some(rule) => out.push_str(&apply_case(&chars[span.start..span.end], rule)),
-            None => out.extend(&chars[span.start..span.end]),
-        }
+        bold.resize(bold.len() + (span.start - at), false);
+        let shown = match span.rule {
+            Some(rule) => apply_case(&chars[span.start..span.end], rule),
+            None => chars[span.start..span.end].iter().collect(),
+        };
+        bold.resize(bold.len() + shown.chars().count(), span.character);
+        out.push_str(&shown);
         at = span.end;
     }
     out.extend(&chars[at..]);
-    out
+    bold.resize(bold.len() + (chars.len() - at), false);
+    (out, bold)
 }
 
 /// Cómo se escribe el nombre actual de algo vinculado dentro de un párrafo. En un encabezado de personaje va en
@@ -9444,5 +9484,28 @@ mod tests {
                 .map(|(_, cents, _)| cents)
         };
         assert_eq!(total(&p), Some(150_000));
+    }
+
+    #[test]
+    fn a_project_from_another_person_links_existing_cards_but_never_creates_one_from_half_typed_text() {
+        let mut p = Project::default();
+        p.paragraphs = vec![
+            p.make_paragraph(ParagraphKind::SceneHeading, "INT. CAS - DIA"),
+            p.make_paragraph(ParagraphKind::Character, "SAN"),
+        ];
+        p.normalize_incoming();
+        assert!(p.characters.is_empty(), "«SAN» es lo que la otra persona alcanzó a escribir");
+        assert!(p.location_profiles.is_empty());
+        assert!(p.paragraphs.iter().all(|q| q.links.is_empty()));
+        // Cuando la persona suelta el foco (o se abre el proyecto) la ficha se crea una sola vez.
+        p.paragraphs[1].text = "SANDIA".into();
+        p.normalize();
+        assert_eq!(p.characters.len(), 1);
+        assert_eq!(p.characters[0].name, "SANDIA");
+        // Lo que ya tiene ficha sí se vincula al llegar.
+        p.paragraphs[1].links.clear();
+        p.normalize_incoming();
+        assert_eq!(p.characters.len(), 1);
+        assert_eq!(p.paragraphs[1].links.len(), 1);
     }
 }

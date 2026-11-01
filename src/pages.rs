@@ -10,7 +10,7 @@ use crate::{
     icon,
     model::{DocKind, MindNode, Project, StoryRole, TemplateSection},
     profile,
-    storage::{RecentCard, Settings},
+    storage::{CloudState, RecentCard, Settings},
     theme::{self, Palette, Scheme, bold_family},
     widgets::{Row, accent_button, card, column, field, stepper, tree_row},
 };
@@ -2799,14 +2799,19 @@ pub fn settings(
     use crate::ui::kit;
     let (mut changed, mut project_changed) = (false, false);
     ui.horizontal_top(|ui| {
-        ui.allocate_ui(vec2(SETTINGS_NAV_W, ui.available_height()), |ui| {
-            ui.spacing_mut().item_spacing.y = tokens::LIST_GAP;
-            for (n, name) in SETTINGS_SECTIONS.iter().enumerate() {
-                if kit::tree_row(ui, p, kit::Row { depth: 0, caret: None, icon: None, label: name, selected: *section == n }).clicked() {
-                    *section = n;
+        ui.allocate_ui_with_layout(
+            vec2(SETTINGS_NAV_W, ui.available_height()),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(SETTINGS_NAV_W);
+                ui.spacing_mut().item_spacing.y = tokens::LIST_GAP;
+                for (n, name) in SETTINGS_SECTIONS.iter().enumerate() {
+                    if kit::tree_row(ui, p, kit::Row { depth: 0, caret: None, icon: None, label: name, selected: *section == n }).clicked() {
+                        *section = n;
+                    }
                 }
-            }
-        });
+            },
+        );
         ui.add_space(tokens::SP_XL);
         egui::ScrollArea::vertical().id_salt(("settings_body", *section)).auto_shrink([false; 2]).show(ui, |ui| {
             column(ui, tokens::SETTINGS_MAX, |ui| match *section {
@@ -3082,19 +3087,31 @@ fn story_card(ui: &mut Ui, p: &Palette, card: &RecentCard) -> egui::Response {
         ui.painter()
             .galley(egui::pos2(cover.right() + pad, y), g, p.dim);
     }
-    ui.painter().text(
+    let when = ago(card.modified);
+    let when_rect = ui.painter().text(
         egui::pos2(cover.right() + pad, rect.bottom() - 14.0),
         Align2::LEFT_CENTER,
-        ago(card.modified),
+        &when,
         FontId::proportional(12.0),
         p.dim,
     );
+    // Los cambios hechos acá que todavía no están en la nube.
+    if let Some(cloud) = card.cloud.as_ref().filter(|c| c.pending > 0) {
+        let text = format!("{}{} sin subir", if when.is_empty() { "" } else { "  ·  " }, cloud.pending);
+        ui.painter().text(egui::pos2(when_rect.right(), rect.bottom() - 14.0), Align2::LEFT_CENTER, text, FontId::proportional(12.0), p.warning);
+    }
     let corner = egui::pos2(rect.right() - 22.0, rect.bottom() - 14.0);
     match &card.cloud {
         Some(cloud) => {
             group_line(ui, p, egui::pos2(cover.right() + pad, rect.bottom() - 34.0), &cloud.group, text_w);
-            cloud_globe(ui, p, corner, cloud.syncing);
-            let tip = if cloud.syncing { "Sincronizando con la nube" } else { "Sincronizado con la nube" };
+            let (glyph, color, tip) = match cloud.state {
+                CloudState::Synced => (icon::GLOBE, p.success, "Sincronizado con la nube"),
+                CloudState::Syncing => (icon::GLOBE, p.warning, "Sincronizando con la nube"),
+                CloudState::Checking => (icon::GLOBE, p.dim, "Comprobando la cuenta…"),
+                CloudState::SignedOut => (icon::GLOBE, p.dim, "Iniciá sesión para sincronizar este proyecto"),
+                CloudState::NoAccess => (icon::LOCK_SIMPLE, p.dim, "Tu cuenta no es de este grupo: no se sincroniza"),
+            };
+            cloud_globe(ui, glyph, color, corner, cloud.state == CloudState::Syncing);
             return resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
         }
         None => {
@@ -3115,7 +3132,7 @@ pub struct RemoteCard {
 
 /// El grupo al que pertenece el proyecto: su icono y nombre, en una línea.
 fn group_line(ui: &Ui, p: &Palette, pos: egui::Pos2, group: &str, width: f32) {
-    let name = if group.is_empty() { "Grupo" } else { group };
+    let name = if group.is_empty() { "Grupo de la nube" } else { group };
     let font = FontId::proportional(12.0);
     let icon_w = 18.0;
     ui.painter().text(pos, Align2::LEFT_CENTER, icon::USERS_THREE, FontId::proportional(14.0), p.accent);
@@ -3126,9 +3143,8 @@ fn group_line(ui: &Ui, p: &Palette, pos: egui::Pos2, group: &str, width: f32) {
 }
 
 /// La Tierra de la nube: verde si está sincronizado y amarilla, girando, mientras sincroniza.
-fn cloud_globe(ui: &Ui, p: &Palette, center: egui::Pos2, syncing: bool) {
-    let color = if syncing { p.warning } else { p.success };
-    let galley = ui.painter().layout_no_wrap(icon::GLOBE.to_string(), FontId::proportional(20.0), color);
+fn cloud_globe(ui: &Ui, glyph: &str, color: Color32, center: egui::Pos2, syncing: bool) {
+    let galley = ui.painter().layout_no_wrap(glyph.to_string(), FontId::proportional(20.0), color);
     let angle = if syncing {
         ui.ctx().request_repaint();
         (ui.input(|i| i.time) as f32 * std::f32::consts::TAU * 0.8) % std::f32::consts::TAU
@@ -3153,7 +3169,7 @@ fn remote_card(ui: &mut Ui, p: &Palette, card: &RemoteCard) -> egui::Response {
     let radius = egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 };
     ui.painter().rect_filled(cover, radius, theme::mix(p.container, p.accent, if hover { 0.28 } else { 0.16 }));
     if card.downloading {
-        cloud_globe(ui, p, cover.center(), true);
+        cloud_globe(ui, icon::GLOBE, p.warning, cover.center(), true);
     } else {
         ui.painter().text(cover.center(), Align2::CENTER_CENTER, icon::DOWNLOAD_SIMPLE, FontId::proportional(44.0), p.accent);
     }

@@ -93,6 +93,9 @@ fn twips(inches: f32) -> i32 {
     (inches * 1440.0).round() as i32
 }
 
+/// Cuánto sobresale el número de escena hacia el margen izquierdo, en pulgadas.
+const NUMBER_W: f32 = 0.6;
+
 /// Un párrafo: su texto (las líneas separadas por «\n» salen como saltos de línea) y su formato.
 struct Para {
     lines: Vec<String>,
@@ -104,8 +107,14 @@ struct Para {
     align: &'static str,
     keep_next: bool,
     bold: bool,
+    /// Qué caracteres del texto van en negrita (un valor por carácter; vacío: ninguno).
+    marks: Vec<bool>,
     underline: bool,
     page_break_before: bool,
+    /// El número de la escena, a la izquierda del encabezado (en el margen) y, si la numeración está bloqueada, también a la
+    /// derecha: en ese caso, la posición (en twips desde el margen izquierdo) donde va.
+    number: Option<String>,
+    number_right: Option<i32>,
 }
 
 impl Para {
@@ -118,8 +127,11 @@ impl Para {
             align: "left",
             keep_next: false,
             bold: false,
+            marks: Vec::new(),
             underline: false,
             page_break_before: false,
+            number: None,
+            number_right: None,
         }
     }
 
@@ -132,12 +144,21 @@ impl Para {
             props.push_str("<w:pageBreakBefore/>");
         }
         props.push_str("<w:widowControl/>");
+        if self.number.is_some() {
+            props.push_str("<w:tabs><w:tab w:val=\"left\" w:pos=\"0\"/>");
+            if let Some(pos) = self.number_right {
+                props.push_str(&format!("<w:tab w:val=\"left\" w:pos=\"{pos}\"/>"));
+            }
+            props.push_str("</w:tabs>");
+        }
         props.push_str(&format!(
             "<w:spacing w:before=\"{}\" w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/>",
             (self.before * 240.0).round() as i32
         ));
+        // El número sobresale 0,6" hacia el margen: la primera línea arranca ahí y el texto sigue en su lugar.
+        let hanging = if self.number.is_some() { format!(" w:hanging=\"{}\"", twips(NUMBER_W)) } else { String::new() };
         props.push_str(&format!(
-            "<w:ind w:left=\"{}\" w:right=\"{}\"/>",
+            "<w:ind w:left=\"{}\" w:right=\"{}\"{hanging}/>",
             twips(self.left),
             twips(self.right)
         ));
@@ -153,14 +174,37 @@ impl Para {
             run_props.push_str("<w:u w:val=\"single\"/>");
         }
         let mut runs = String::new();
+        if let Some(number) = &self.number {
+            runs.push_str(&format!("<w:r><w:t xml:space=\"preserve\">{}.</w:t></w:r><w:r><w:tab/></w:r>", escape(number)));
+        }
+        let mut offset = 0;
         for (n, line) in self.lines.iter().enumerate() {
             if n > 0 {
                 runs.push_str("<w:r><w:br/></w:r>");
             }
-            runs.push_str(&format!(
-                "<w:r><w:rPr>{run_props}</w:rPr><w:t xml:space=\"preserve\">{}</w:t></w:r>",
-                escape(line)
-            ));
+            let chars: Vec<char> = line.chars().collect();
+            let marked = |i: usize| self.marks.get(offset + i).copied().unwrap_or(false);
+            let mut from = 0;
+            while from < chars.len() || (from == 0 && chars.is_empty()) {
+                let flag = marked(from);
+                let mut to = from;
+                while to < chars.len() && marked(to) == flag {
+                    to += 1;
+                }
+                let props = if flag && !self.bold { format!("<w:b/>{run_props}") } else { run_props.clone() };
+                runs.push_str(&format!(
+                    "<w:r><w:rPr>{props}</w:rPr><w:t xml:space=\"preserve\">{}</w:t></w:r>",
+                    escape(&chars[from..to].iter().collect::<String>())
+                ));
+                if chars.is_empty() {
+                    break;
+                }
+                from = to;
+            }
+            offset += chars.len() + 1;
+        }
+        if let (Some(number), Some(_)) = (&self.number, self.number_right) {
+            runs.push_str(&format!("<w:r><w:tab/></w:r><w:r><w:t xml:space=\"preserve\">{}.</w:t></w:r>", escape(number)));
         }
         format!("<w:p><w:pPr>{props}</w:pPr>{runs}</w:p>")
     }
@@ -172,6 +216,7 @@ fn paragraph(
     text: &str,
     previous: Option<ParagraphKind>,
     sheet: Sheet,
+    bold_names: bool,
 ) -> Para {
     use ParagraphKind::*;
     let text_w = sheet.text_w();
@@ -186,6 +231,7 @@ fn paragraph(
             para.left = 2.2;
             para.right = (text_w - 2.2 - 3.8).max(0.0);
             para.keep_next = true;
+            para.bold = bold_names;
         }
         Parenthetical => {
             para.before = 0.0;
@@ -249,7 +295,7 @@ fn sect_pr(sheet: Sheet, header: bool, restart_numbers: bool) -> String {
 }
 
 /// El guion como un .docx en memoria.
-pub fn export(project: &Project, paper: Paper) -> Vec<u8> {
+pub fn export(project: &Project, paper: Paper, bold_names: bool) -> Vec<u8> {
     let sheet = paper.sheet();
     let mut body = String::new();
 
@@ -277,11 +323,12 @@ pub fn export(project: &Project, paper: Paper) -> Vec<u8> {
     }
 
     // El guion. Las notas no se imprimen.
-    let shown = project.shown_paragraphs();
+    let shown = project.shown_paragraphs_marked();
     let conts = project.cont_marks();
+    let labels: std::collections::HashMap<u64, String> = project.scene_labels().into_iter().collect();
     let mut previous: Option<ParagraphKind> = None;
     let mut any = false;
-    for (i, (kind, text)) in shown.iter().enumerate() {
+    for (i, (kind, text, flags)) in shown.iter().enumerate() {
         if *kind == ParagraphKind::Note || text.trim().is_empty() {
             continue;
         }
@@ -293,7 +340,19 @@ pub fn export(project: &Project, paper: Paper) -> Vec<u8> {
         if conts.get(i).copied().unwrap_or(false) {
             text.push_str(" (CONT.)");
         }
-        body.push_str(&paragraph(*kind, &text, previous, sheet).xml(None));
+        let mut para = paragraph(*kind, &text, previous, sheet, bold_names);
+        if *kind == ParagraphKind::SceneHeading
+            && let Some(number) = labels.get(&project.paragraphs[i].id)
+        {
+            para.number = Some(number.clone());
+            if project.scene_numbers_locked {
+                para.number_right = Some(twips(sheet.text_w() + 0.2));
+            }
+        }
+        if bold_names {
+            para.marks = flags.clone();
+        }
+        body.push_str(&para.xml(None));
         previous = Some(*kind);
         any = true;
     }
@@ -377,13 +436,30 @@ mod tests {
     }
 
     #[test]
+    fn bold_names_make_the_character_line_and_the_named_characters_bold() {
+        let mut p = Project::default();
+        p.paragraphs = [(Action, "Hoy Ana espera."), (Character, "ANA"), (Dialogue, "Hola")]
+            .iter()
+            .map(|(k, t)| p.make_paragraph(*k, t))
+            .collect();
+        p.auto_link_all();
+        let xml = |bold| String::from_utf8(unzip(&export(&p, Paper::A4, bold))[2].1.clone()).unwrap();
+        assert!(!xml(false).contains("<w:b/>"));
+        let on = xml(true);
+        assert!(on.contains("<w:rPr></w:rPr><w:t xml:space=\"preserve\"> espera.</w:t>"), "{on}");
+        // Dos tramos en negrita: el nombre dentro de la acción y el del personaje que habla.
+        assert_eq!(on.matches("<w:b/></w:rPr><w:t xml:space=\"preserve\">ANA</w:t>").count(), 2, "{on}");
+        assert!(on.contains("<w:rPr></w:rPr><w:t xml:space=\"preserve\">Hoy </w:t>"));
+    }
+
+    #[test]
     fn crc_matches_the_known_value() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]
     fn the_docx_holds_every_part_with_the_page_and_the_indents_of_the_view() {
-        let bytes = export(&sample(), Paper::A4);
+        let bytes = export(&sample(), Paper::A4, false);
         let files = unzip(&bytes);
         let names: Vec<_> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
@@ -421,7 +497,7 @@ mod tests {
         assert_eq!(doc.matches("<w:sectPr>").count(), 2);
         assert!(doc.contains("<w:titlePg/>") && doc.contains("w:headerReference"));
         let letter =
-            String::from_utf8(unzip(&export(&sample(), Paper::Letter))[2].1.clone()).unwrap();
+            String::from_utf8(unzip(&export(&sample(), Paper::Letter, false))[2].1.clone()).unwrap();
         assert!(letter.contains("w:w=\"12240\" w:h=\"15840\""));
     }
 
@@ -432,7 +508,26 @@ mod tests {
             .iter()
             .map(|(k, t)| p.make_paragraph(*k, t))
             .collect();
-        let doc = String::from_utf8(unzip(&export(&p, Paper::A4))[2].1.clone()).unwrap();
+        let doc = String::from_utf8(unzip(&export(&p, Paper::A4, false))[2].1.clone()).unwrap();
         assert_eq!(doc.matches("<w:pageBreakBefore/>").count(), 1);
+    }
+
+    #[test]
+    fn scene_numbers_go_beside_the_heading_and_on_both_sides_when_locked() {
+        let mut p = Project::default();
+        p.paragraphs = [(SceneHeading, "INT. LIVING - NOCHE"), (Action, "Ana espera."), (SceneHeading, "EXT. CALLE - DIA")]
+            .iter()
+            .map(|(k, t)| p.make_paragraph(*k, t))
+            .collect();
+        let xml = |p: &Project| String::from_utf8(unzip(&export(p, Paper::A4, false))[2].1.clone()).unwrap();
+        let free = xml(&p);
+        assert!(free.contains("<w:t xml:space=\"preserve\">1.</w:t></w:r><w:r><w:tab/></w:r>"), "{free}");
+        assert!(free.contains("<w:t xml:space=\"preserve\">2.</w:t></w:r><w:r><w:tab/></w:r>"));
+        // Sin bloquear, solo a la izquierda: la segunda pestaña (la del lado derecho) no existe.
+        assert_eq!(free.matches("<w:tab w:val=\"left\"").count(), 2, "una pestaña por encabezado");
+        p.lock_scene_numbers();
+        let fixed = xml(&p);
+        assert_eq!(fixed.matches("<w:tab w:val=\"left\"").count(), 4, "con la numeración bloqueada, también a la derecha");
+        assert!(fixed.contains("<w:r><w:tab/></w:r><w:r><w:t xml:space=\"preserve\">1.</w:t></w:r>"));
     }
 }

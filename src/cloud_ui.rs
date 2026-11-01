@@ -90,6 +90,10 @@ enum Event {
     NeedsConfirmation,
     /// Todavía no se confirmó el mail.
     StillWaiting,
+    /// No había una sesión guardada que retomar.
+    NoSession,
+    /// La sincronización no pudo llegar a la nube.
+    Offline,
     Left(String),
     AllProjects(Vec<(String, String, String)>),
     RecoverySent,
@@ -119,10 +123,13 @@ fn worker(url: String, key: String, jobs: Receiver<Job>, events: Sender<Event>, 
         }
     };
     // Si había una sesión guardada en el llavero, se intenta retomar.
-    if client.ensure_session().is_ok()
-        && let Some(email) = client.email()
-    {
-        let _ = events.send(Event::SignedIn(email.to_string()));
+    match client.ensure_session() {
+        Ok(()) if client.email().is_some() => {
+            let _ = events.send(Event::SignedIn(client.email().unwrap_or_default().to_string()));
+        }
+        _ => {
+            let _ = events.send(Event::NoSession);
+        }
     }
     while let Ok(job) = jobs.recv() {
         let event = run(&mut client, job);
@@ -191,6 +198,7 @@ fn run(client: &mut Client<HttpsTransport>, job: Job) -> Event {
             .unwrap_or_else(fail_sync),
         Job::Sync { file, mut link, who } => match cloudsync::sync_once(client, &file, &mut link, &who) {
             Ok(report) => Event::Synced(report, link),
+            Err(e) if e.is_offline() => Event::Offline,
             Err(e) => fail_sync(e),
         },
         Job::Images(work) => Event::Images(cloudimages::run(client, work)),
@@ -270,6 +278,12 @@ pub struct CloudUi {
     linked_at: f64,
     new_group: String,
     join_code: String,
+    /// Ya llegó la lista de grupos de esta sesión.
+    groups_known: bool,
+    /// La última sincronización no pudo llegar a la nube.
+    offline: bool,
+    /// Ya se sabe si hay sesión guardada o no (la primera respuesta del hilo).
+    started_checked: bool,
     /// El último código de invitación creado: (grupo, código).
     invite: Option<(String, String)>,
     note: String,
@@ -344,6 +358,8 @@ impl CloudUi {
         self.tx = None;
         self.rx = None;
         self.signed_as = None;
+        self.started_checked = false;
+        self.groups_known = false;
         self.groups.clear();
         if !Self::configured(settings) {
             self.started_with = None;
@@ -372,6 +388,7 @@ impl CloudUi {
             self.busy = false;
             match event {
                 Event::SignedIn(email) => {
+                    self.started_checked = true;
                     self.forgot = false;
                     self.code_sent = false;
                     self.code.clear();
@@ -399,6 +416,7 @@ impl CloudUi {
                 Event::SignedOut => {
                     self.cloud_name = None;
                     self.name_loaded = false;
+                    self.groups_known = false;
                     self.signed_as = None;
                     self.groups.clear();
                     self.catalog.clear();
@@ -415,6 +433,14 @@ impl CloudUi {
                     self.last_wait = f64::NEG_INFINITY;
                 }
                 Event::StillWaiting => self.wait_busy = false,
+                Event::NoSession => self.started_checked = true,
+                Event::Offline => {
+                    self.syncing = false;
+                    if !self.offline {
+                        self.offline = true;
+                        out.message = Some("Sin conexión: tus cambios quedan en esta computadora y se suben cuando vuelva.".into());
+                    }
+                }
                 Event::Left(group) => {
                     self.leave_confirm = None;
                     self.invite = None;
@@ -431,6 +457,7 @@ impl CloudUi {
                 }
                 Event::Groups(groups) => {
                     self.groups = groups;
+                    self.groups_known = true;
                     self.request_catalog();
                     self.usage.retain(|id, _| self.groups.iter().any(|g| &g.0 == id));
                     for id in self.groups.iter().map(|g| g.0.clone()).collect::<Vec<_>>() {
@@ -454,6 +481,10 @@ impl CloudUi {
                 }
                 Event::Synced(report, new_link) => {
                     self.syncing = false;
+                    if self.offline {
+                        self.offline = false;
+                        out.message = Some("Volvió la conexión: se sincronizó con la nube.".into());
+                    }
                     out.synced = true;
                     out.disk_changed = !report.pulled.is_empty() || !report.merged.is_empty() || !report.conflicts.is_empty();
                     if !report.conflicts.is_empty() {
@@ -546,6 +577,27 @@ impl CloudUi {
                 group: self.groups.iter().find(|g| &g.0 == group).map(|g| g.1.clone()).unwrap_or_default(),
             })
             .collect()
+    }
+
+    /// ¿Falló la última sincronización por falta de conexión?
+    pub fn offline(&self) -> bool {
+        self.offline
+    }
+
+    /// ¿Puede esta cuenta sincronizar un proyecto de ese grupo?
+    pub fn state_of(&self, group_id: &str, downloading: bool) -> crate::storage::CloudState {
+        use crate::storage::CloudState;
+        if self.signed_as.is_none() {
+            // Con el hilo todavía arrancando (se retoma la sesión guardada) no se sabe: se comprueba.
+            return if self.tx.is_some() && !self.started_checked { CloudState::Checking } else { CloudState::SignedOut };
+        }
+        if downloading {
+            return CloudState::Syncing;
+        }
+        if !self.groups_known {
+            return CloudState::Checking;
+        }
+        if self.groups.iter().any(|g| g.0 == group_id) { CloudState::Synced } else { CloudState::NoAccess }
     }
 
     /// El nombre de un grupo mío.

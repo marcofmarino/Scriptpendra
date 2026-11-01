@@ -136,6 +136,34 @@ impl SyncError {
     }
 }
 
+impl SyncError {
+    /// ¿Es que no hay conexión? No es un error de la persona: los cambios quedan en la carpeta y se suben cuando vuelva.
+    pub fn is_offline(&self) -> bool {
+        matches!(self, SyncError::Cloud(CloudError::Offline(_)))
+    }
+}
+
+/// Cuántos cambios de la carpeta todavía no se subieron a la nube (lo que difiere de lo último sincronizado). Cada sección
+/// cambiada cuenta como mínimo uno; se acota en 99.
+pub fn pending_changes(file: &Path) -> usize {
+    let Ok(sections) = folder::read_sections(file) else {
+        return 0;
+    };
+    let mut total = 0;
+    for (name, bytes) in sections {
+        if !cloud::is_section_name(&name) || bytes.len() > cloud::MAX_SECTION_BYTES {
+            continue;
+        }
+        let base = fs::read(base_path(file, &name)).ok();
+        if base.as_deref() == Some(bytes.as_slice()) {
+            continue;
+        }
+        let empty = b"{}".to_vec();
+        total += folder::describe_change(base.as_ref().unwrap_or(&empty), &bytes, 99).len().max(1);
+    }
+    total.min(99)
+}
+
 /// Trae de la nube lo que cambió desde la última vez.
 pub fn pull<T: Transport>(
     client: &mut Client<T>,
@@ -506,6 +534,22 @@ mod tests {
         let backups: Vec<_> = fs::read_dir(conflict_dir(&luis_dir)).unwrap().flatten().collect();
         assert_eq!(backups.len(), 1);
         assert!(fs::read_to_string(backups[0].path()).unwrap().contains("de Luis"));
+    }
+
+    #[test]
+    fn changes_not_uploaded_yet_are_counted_until_the_next_sync() {
+        let server = Arc::new(Mutex::new(Server::default()));
+        let mut ana = person(&server);
+        let dir = folder_for("pending");
+        let mut ana_link = link();
+        put(&dir, "guion", r#"{"paragraphs":[{"id":1,"text":"uno"}]}"#);
+        assert!(pending_changes(&dir) >= 1, "una sección nueva todavía no subida");
+        sync_once(&mut ana, &dir, &mut ana_link, "Ana").unwrap();
+        assert_eq!(pending_changes(&dir), 0);
+        put(&dir, "guion", r#"{"paragraphs":[{"id":1,"text":"uno"},{"id":2,"text":"dos"}]}"#);
+        assert_eq!(pending_changes(&dir), 1);
+        sync_once(&mut ana, &dir, &mut ana_link, "Ana").unwrap();
+        assert_eq!(pending_changes(&dir), 0);
     }
 
     #[test]

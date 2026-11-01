@@ -66,6 +66,8 @@ struct Element {
     kind: ParagraphKind,
     /// Cada renglón con su sangría extra en columnas.
     rows: Vec<(f32, String)>,
+    /// Qué caracteres de cada renglón van en negrita (vacío: ninguno; solo las acciones con personajes nombrados).
+    marks: Vec<Vec<bool>>,
     /// Sangría del bloque y ancho de su caja, en pulgadas desde el margen izquierdo.
     left: f32,
     width: f32,
@@ -81,35 +83,48 @@ struct Element {
 /// Parte un texto en renglones de a lo sumo `cols` caracteres, cortando entre palabras (una palabra más larga que el
 /// renglón se corta donde llega).
 pub fn wrap(text: &str, cols: usize) -> Vec<String> {
+    wrap_marked(text, &[], cols).into_iter().map(|(row, _)| row).collect()
+}
+
+/// Lo mismo que `wrap`, y por cada renglón qué caracteres van en negrita según `marks` (un valor por carácter del texto; si
+/// falta alguno, no va en negrita). Un espacio entre dos palabras en negrita también lo va.
+pub fn wrap_marked(text: &str, marks: &[bool], cols: usize) -> Vec<(String, Vec<bool>)> {
     let cols = cols.max(1);
-    let mut out = Vec::new();
-    for paragraph in text.split('\n') {
-        let mut line = String::new();
-        let mut len = 0;
-        for word in paragraph.split_whitespace() {
-            let mut word: Vec<char> = word.chars().collect();
+    let mut paragraphs: Vec<Vec<(char, bool)>> = vec![Vec::new()];
+    for (i, c) in text.chars().enumerate() {
+        if c == '\n' {
+            paragraphs.push(Vec::new());
+        } else {
+            paragraphs.last_mut().expect("siempre hay un párrafo").push((c, marks.get(i).copied().unwrap_or(false)));
+        }
+    }
+    let mut out: Vec<Vec<(char, bool)>> = Vec::new();
+    for paragraph in paragraphs {
+        let mut line: Vec<(char, bool)> = Vec::new();
+        for word in paragraph.split(|(c, _)| c.is_whitespace()).filter(|w| !w.is_empty()) {
+            let mut word: Vec<(char, bool)> = word.to_vec();
             while word.len() > cols {
-                if len > 0 {
+                if !line.is_empty() {
                     out.push(std::mem::take(&mut line));
-                    len = 0;
                 }
                 out.push(word.drain(..cols).collect());
             }
-            let w = word.len();
-            if len > 0 && len + 1 + w > cols {
+            if !line.is_empty() && line.len() + 1 + word.len() > cols {
                 out.push(std::mem::take(&mut line));
-                len = 0;
             }
-            if len > 0 {
-                line.push(' ');
-                len += 1;
+            if let Some(&(_, before)) = line.last() {
+                line.push((' ', before && word.first().is_some_and(|w| w.1)));
             }
             line.extend(word);
-            len += w;
         }
         out.push(line);
     }
-    out
+    out.into_iter().map(|row| (row.iter().map(|(c, _)| *c).collect(), row.iter().map(|(_, b)| *b).collect())).collect()
+}
+
+/// Cuántos caracteres de espacio hay al comienzo del texto.
+fn text_lead(text: &str) -> usize {
+    text.chars().count() - text.trim_start().chars().count()
 }
 
 fn columns(inches: f32) -> usize {
@@ -120,17 +135,14 @@ fn columns(inches: f32) -> usize {
 fn elements(project: &Project, paper: Paper, bold_names: bool) -> Vec<Element> {
     let sheet = paper.sheet();
     let text_w = sheet.text_w();
-    let shown = project.shown_paragraphs();
+    let shown = project.shown_paragraphs_marked();
     let conts = project.cont_marks();
     let revised = project.revised_paragraphs();
-    let labels: std::collections::HashMap<u64, String> = if project.scene_numbers_locked {
-        project.scene_labels().into_iter().collect()
-    } else {
-        Default::default()
-    };
+    // El número de cada escena va siempre a la izquierda del encabezado, como en la hoja de la pantalla.
+    let labels: std::collections::HashMap<u64, String> = project.scene_labels().into_iter().collect();
     let mut out: Vec<Element> = Vec::new();
     let mut previous: Option<ParagraphKind> = None;
-    for (i, (kind, text)) in shown.iter().enumerate() {
+    for (i, (kind, text, flags)) in shown.iter().enumerate() {
         use ParagraphKind::*;
         if *kind == Note || text.trim().is_empty() {
             continue;
@@ -140,6 +152,13 @@ fn elements(project: &Project, paper: Paper, bold_names: bool) -> Vec<Element> {
         } else {
             text.trim().to_string()
         };
+        // La negrita de los personajes nombrados sigue al texto recortado.
+        let lead = text_lead(&shown[i].1);
+        let flags: Vec<bool> = if bold_names {
+            flags.iter().skip(lead).take(text.chars().count()).copied().collect()
+        } else {
+            Vec::new()
+        };
         if conts.get(i).copied().unwrap_or(false) {
             text.push_str(" (CONT.)");
         }
@@ -147,6 +166,7 @@ fn elements(project: &Project, paper: Paper, bold_names: bool) -> Vec<Element> {
         let mut el = Element {
             kind: *kind,
             rows: Vec::new(),
+            marks: Vec::new(),
             left: 0.0,
             width: text_w,
             align: Align::Left,
@@ -162,7 +182,11 @@ fn elements(project: &Project, paper: Paper, bold_names: bool) -> Vec<Element> {
                 el.gap = 2.0;
                 el.scene_number = labels.get(&project.paragraphs[i].id).cloned();
             }
-            Action => el.rows = plain(wrap(&text, columns(text_w))),
+            Action => {
+                let wrapped = wrap_marked(&text, &flags, columns(text_w));
+                el.marks = wrapped.iter().map(|(_, m)| m.clone()).collect();
+                el.rows = wrapped.into_iter().map(|(r, _)| (0.0, r)).collect();
+            }
             Character => {
                 el.left = 2.2;
                 el.width = (3.8f32).min(text_w - 2.2);
@@ -318,14 +342,38 @@ pub fn layout(project: &Project, paper: Paper, bold_names: bool) -> Layout {
             }
             for r in 0..*rows_here {
                 let (extra, text) = &el.rows[next_row + r];
-                put(
-                    at.page + k,
-                    start + r as f32,
-                    x_of(*extra, text),
-                    text.clone(),
-                    el.bold,
-                    el.underline,
-                );
+                let marks = el.marks.get(next_row + r).filter(|m| m.iter().any(|b| *b));
+                match marks {
+                    // Con personajes nombrados en negrita el renglón se parte en tramos; la letra es de ancho fijo.
+                    Some(marks) => {
+                        let chars: Vec<char> = text.chars().collect();
+                        let mut from = 0;
+                        while from < chars.len() {
+                            let flag = marks.get(from).copied().unwrap_or(false);
+                            let mut to = from;
+                            while to < chars.len() && marks.get(to).copied().unwrap_or(false) == flag {
+                                to += 1;
+                            }
+                            put(
+                                at.page + k,
+                                start + r as f32,
+                                x_of(*extra, text) + from as f32 * CHAR_W,
+                                chars[from..to].iter().collect(),
+                                flag,
+                                el.underline,
+                            );
+                            from = to;
+                        }
+                    }
+                    None => put(
+                        at.page + k,
+                        start + r as f32,
+                        x_of(*extra, text),
+                        text.clone(),
+                        el.bold,
+                        el.underline,
+                    ),
+                }
                 if el.changed {
                     put(
                         at.page + k,
@@ -347,14 +395,17 @@ pub fn layout(project: &Project, paper: Paper, bold_names: bool) -> Layout {
                         false,
                         false,
                     );
-                    put(
-                        at.page,
-                        start,
-                        left + text_w + 2.0 * CHAR_W,
-                        tag,
-                        false,
-                        false,
-                    );
+                    // Con la numeración bloqueada (guion de rodaje) también va del lado derecho.
+                    if project.scene_numbers_locked {
+                        put(
+                            at.page,
+                            start,
+                            left + text_w + 2.0 * CHAR_W,
+                            tag,
+                            false,
+                            false,
+                        );
+                    }
                 }
             }
             next_row += rows_here;
@@ -1015,6 +1066,51 @@ mod tests {
     }
 
     #[test]
+    fn scene_numbers_are_printed_beside_every_heading_and_on_both_sides_when_locked() {
+        let mut p = project(&[(SceneHeading, "INT. CASA - DIA".into()), (Action, "Ana.".into()), (SceneHeading, "EXT. CALLE - DIA".into())]);
+        let tags = |p: &Project| -> Vec<String> {
+            layout(p, Paper::A4, false).pages[0].iter().filter(|l| l.text.ends_with('.') && l.text[..l.text.len() - 1].parse::<u32>().is_ok()).map(|l| l.text.clone()).collect()
+        };
+        assert_eq!(tags(&p), ["1.", "2."], "sin bloquear: solo a la izquierda");
+        p.lock_scene_numbers();
+        assert_eq!(tags(&p), ["1.", "1.", "2.", "2."], "bloqueada: a los dos lados");
+    }
+
+    #[test]
+    fn marked_wrapping_keeps_the_bold_marks_on_their_words() {
+        let marks: Vec<bool> = "Ana y Luis hablan".chars().enumerate().map(|(i, _)| i < 3 || (6..10).contains(&i)).collect();
+        let rows = wrap_marked("Ana y Luis hablan", &marks, 10);
+        assert_eq!(rows.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), ["Ana y Luis", "hablan"]);
+        assert_eq!(rows[0].1, [true, true, true, false, false, false, true, true, true, true]);
+        assert!(rows[1].1.iter().all(|b| !b));
+        // Dos palabras seguidas en negrita (un nombre compuesto) llevan el espacio también.
+        let marks = vec![true; 11];
+        assert!(wrap_marked("Juan Carlos", &marks, 20)[0].1.iter().all(|b| *b));
+    }
+
+    #[test]
+    fn characters_named_in_an_action_are_bold_in_the_pdf_only_when_asked() {
+        let mut p = project(&[
+            (Action, "Hoy Ana espera en la puerta.".into()),
+            (Character, "ANA".into()),
+            (Dialogue, "Hola".into()),
+        ]);
+        p.auto_link_all();
+        let bold_text = |bold_names: bool| -> Vec<String> {
+            layout(&p, Paper::A4, bold_names).pages[0].iter().filter(|l| l.bold).map(|l| l.text.clone()).collect()
+        };
+        assert!(bold_text(false).is_empty());
+        let on = bold_text(true);
+        // El nombre dentro de la acción (según la opción de mayúsculas del proyecto) y el del personaje que habla.
+        assert_eq!(on, ["ANA", "ANA"]);
+        // Lo que no es el nombre queda en la misma línea, sin negrita y bien ubicado.
+        let page = &layout(&p, Paper::A4, true).pages[0];
+        let name = page.iter().find(|l| l.text == "ANA" && l.bold).unwrap();
+        let before = page.iter().find(|l| l.text == "Hoy ").unwrap();
+        assert!((name.x - before.x - 4.0 * CHAR_W).abs() < 0.01 && name.y == before.y);
+    }
+
+    #[test]
     fn text_wraps_between_words_into_columns() {
         assert_eq!(wrap("uno dos tres", 7), ["uno dos", "tres"]);
         assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
@@ -1138,12 +1234,12 @@ mod tests {
                 && texts(&l.cover).contains(&"Guion de".to_string())
                 && texts(&l.cover).contains(&"marco@correo.com".to_string())
         );
+        // Sin bloquear, el número va igual a la izquierda del encabezado, pero ya no del lado derecho.
         p.unlock_scene_numbers();
-        assert!(
-            layout(&p, Paper::Letter, false).pages[0]
-                .iter()
-                .all(|x| x.text != "1.")
-        );
+        let l = layout(&p, Paper::Letter, false);
+        let tags: Vec<&Line> = l.pages[0].iter().filter(|x| x.text == "1.").collect();
+        assert_eq!(tags.len(), 1);
+        assert!(tags[0].x < sheet.left * PT);
     }
 
     #[test]

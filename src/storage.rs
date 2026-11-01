@@ -220,7 +220,7 @@ impl Default for Settings {
             ui_zoom: DEFAULT_ZOOM,
             view_zoom: DEFAULT_VIEW_ZOOM,
             paper: Paper::A4,
-            settings_version: 4,
+            settings_version: 5,
             autosave: true,
             notifications: true,
             name_locked: false,
@@ -228,7 +228,7 @@ impl Default for Settings {
             user_id: 0,
             cloud_url: String::new(),
             cloud_anon_key: String::new(),
-            bold_names: false,
+            bold_names: true,
             treatment_bold: false,
             show_timeline: true,
             sidebar_width: DEFAULT_PANEL_WIDTH,
@@ -344,6 +344,12 @@ impl Settings {
             settings.autosave = true;
             settings.settings_version = 4;
         }
+        // Versión 5: los nombres de personajes en negrita pasan a estar activados por defecto; lo que quedó apagado sin que
+        // nadie lo haya elegido (era el valor de fábrica) se enciende una vez.
+        if settings.settings_version < 5 {
+            settings.bold_names = true;
+            settings.settings_version = 5;
+        }
         settings.sanitize();
         settings
     }
@@ -402,7 +408,24 @@ pub struct CloudBadge {
     pub project_id: String,
     /// El nombre del grupo (vacío hasta que se sabe cuál es).
     pub group: String,
-    pub syncing: bool,
+    pub state: CloudState,
+    /// Cambios de la carpeta que todavía no se subieron a la nube.
+    pub pending: usize,
+}
+
+/// En qué situación está un proyecto de grupo en esta computadora.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloudState {
+    /// Con sesión iniciada y siendo del grupo: se sincroniza al abrirlo.
+    Synced,
+    /// Se está bajando o sincronizando ahora.
+    Syncing,
+    /// Todavía se está comprobando (la sesión o la lista de grupos no llegó).
+    Checking,
+    /// No hay sesión iniciada.
+    SignedOut,
+    /// Hay sesión, pero la cuenta no es de ese grupo.
+    NoAccess,
 }
 
 pub fn recent_cards(settings: &Settings) -> Vec<RecentCard> {
@@ -423,7 +446,8 @@ pub fn recent_cards(settings: &Settings) -> Vec<RecentCard> {
                     group_id: l.group,
                     project_id: l.project,
                     group: String::new(),
-                    syncing: false,
+                    state: CloudState::Checking,
+                    pending: crate::cloudsync::pending_changes(path),
                 }),
             })
         })
@@ -517,6 +541,16 @@ mod tests {
         // Sin archivo, o con basura, quedan los de fábrica.
         assert_eq!(Settings::from_text(None).view_zoom, 100);
         assert_eq!(Settings::from_text(Some("no es json")).view_zoom, 100);
+    }
+
+    #[test]
+    fn bold_character_names_are_on_by_default_and_saved_settings_from_before_get_it_once() {
+        assert!(Settings::default().bold_names);
+        let old = Settings::from_text(Some(r#"{"settings_version": 4, "bold_names": false}"#));
+        assert!(old.bold_names);
+        // Una vez en la versión 5, lo que la persona apague se respeta.
+        let chosen = Settings::from_text(Some(r#"{"settings_version": 5, "bold_names": false}"#));
+        assert!(!chosen.bold_names);
     }
 
     #[test]

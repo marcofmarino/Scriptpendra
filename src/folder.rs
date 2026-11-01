@@ -233,17 +233,100 @@ fn is_id_list(items: &[Value]) -> bool {
     !items.is_empty() && items.iter().all(|v| id_of(v).is_some())
 }
 
+/// Qué pasó al combinar: los lugares donde los dos tocaron lo mismo y si hay que conservar las dos versiones.
+struct Merge {
+    conflicts: Vec<String>,
+    /// «Las dos»: en una lista de cosas con id, si los dos tocaron la misma cosa se queda la mía y la de la otra persona se
+    /// agrega al lado como una cosa nueva.
+    both: bool,
+}
+
+/// Separa un texto en palabras y espacios (cada uno es una pieza), para combinar por palabra.
+fn pieces(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut space = None;
+    for (i, c) in text.char_indices() {
+        let now = c.is_whitespace();
+        if space.is_some_and(|before| before != now) {
+            out.push(&text[start..i]);
+            start = i;
+        }
+        space = Some(now);
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+/// Los cambios de `other` sobre `base`, como tramos: (desde, hasta, piezas nuevas) con posiciones en `base`. `None` si los textos
+/// son demasiado largos para compararlos.
+fn text_hunks(base: &[&str], other: &[&str]) -> Option<Vec<(usize, usize, Vec<String>)>> {
+    let (n, m) = (base.len(), other.len());
+    if n.saturating_mul(m) > 4_000_000 {
+        return None;
+    }
+    // Subsecuencia común más larga.
+    let mut lcs = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[at(i, j)] = if base[i] == other[j] { lcs[at(i + 1, j + 1)] + 1 } else { lcs[at(i + 1, j)].max(lcs[at(i, j + 1)]) };
+        }
+    }
+    let mut hunks = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    let mut open: Option<(usize, usize)> = None;
+    while i < n || j < m {
+        if i < n && j < m && base[i] == other[j] {
+            if let Some((from, other_from)) = open.take() {
+                hunks.push((from, i, other[other_from..j].iter().map(|x| x.to_string()).collect()));
+            }
+            i += 1;
+            j += 1;
+            continue;
+        }
+        open.get_or_insert((i, j));
+        if j < m && (i == n || lcs[at(i, j + 1)] >= lcs[at(i + 1, j)]) {
+            j += 1;
+        } else {
+            i += 1;
+        }
+    }
+    if let Some((from, other_from)) = open {
+        hunks.push((from, n, other[other_from..].iter().map(|x| x.to_string()).collect()));
+    }
+    Some(hunks)
+}
+
+/// Combina por palabra un texto que cambiaron los dos: si cada uno tocó otro lugar se juntan los dos cambios; si tocaron el mismo
+/// lugar (o uno pegado al otro) no se puede y devuelve `None`.
+fn merge_text(base: &str, mine: &str, theirs: &str) -> Option<String> {
+    let (b, m, t) = (pieces(base), pieces(mine), pieces(theirs));
+    let (mine_hunks, their_hunks) = (text_hunks(&b, &m)?, text_hunks(&b, &t)?);
+    let touching = mine_hunks.iter().any(|a| their_hunks.iter().any(|c| a.0 <= c.1 && c.0 <= a.1));
+    if touching {
+        return None;
+    }
+    let mut all: Vec<&(usize, usize, Vec<String>)> = mine_hunks.iter().chain(their_hunks.iter()).collect();
+    all.sort_by_key(|h| (h.0, h.1));
+    let mut out = String::new();
+    let mut at = 0;
+    for (from, to, new) in all {
+        out.push_str(&b[at..*from].concat());
+        out.push_str(&new.concat());
+        at = *to;
+    }
+    out.push_str(&b[at..].concat());
+    Some(out)
+}
+
 /// La combinación de tres vías de un valor: `base` es lo que las dos copias tenían antes, `mine` lo que cambié yo y `theirs` lo
-/// que cambió la otra persona. Lo que cambió uno solo se toma; lo que cambiaron los dos se combina por campo y, en las listas
-/// de cosas con id, cosa por cosa. Si los dos cambiaron lo mismo de distinta forma queda un conflicto (en `conflicts`) y se
-/// conserva lo mío.
-fn merge_opt(
-    base: Option<&Value>,
-    mine: Option<&Value>,
-    theirs: Option<&Value>,
-    path: &str,
-    conflicts: &mut Vec<String>,
-) -> Option<Value> {
+/// que cambió la otra persona. Lo que cambió uno solo se toma; lo que cambiaron los dos se combina por campo, en las listas
+/// de cosas con id, cosa por cosa, y en los textos, palabra por palabra. Si los dos cambiaron lo mismo de distinta forma queda
+/// un conflicto (en `cx.conflicts`) y se conserva lo mío.
+fn merge_opt(base: Option<&Value>, mine: Option<&Value>, theirs: Option<&Value>, path: &str, cx: &mut Merge) -> Option<Value> {
     if mine == theirs {
         return mine.cloned();
     }
@@ -269,11 +352,21 @@ fn merge_opt(
                     continue;
                 }
                 let sub = format!("{path}/{key}");
-                if let Some(v) = merge_opt(b.get(key), m.get(key), t.get(key), &sub, conflicts) {
+                if let Some(v) = merge_opt(b.get(key), m.get(key), t.get(key), &sub, cx) {
                     out.insert(key.clone(), v);
                 }
             }
             Some(Value::Object(out))
+        }
+        (Some(Value::String(m)), Some(Value::String(t))) if base.is_some_and(Value::is_string) => {
+            let b = base.and_then(Value::as_str).unwrap_or("");
+            match merge_text(b, m, t) {
+                Some(text) => Some(Value::String(text)),
+                None => {
+                    cx.conflicts.push(path.to_string());
+                    mine.cloned()
+                }
+            }
         }
         (Some(Value::Array(m)), Some(Value::Array(t)))
             if is_id_list(m) && is_id_list(t) && base.is_none_or(|b| b.as_array().is_some_and(|a| a.is_empty() || is_id_list(a))) =>
@@ -281,35 +374,56 @@ fn merge_opt(
             let b: Vec<Value> = base.and_then(Value::as_array).cloned().unwrap_or_default();
             let find = |list: &[Value], id: u64| list.iter().find(|v| id_of(v) == Some(id)).cloned();
             let mut order: Vec<u64> = m.iter().filter_map(id_of).collect();
-            for id in t.iter().filter_map(id_of) {
-                if !order.contains(&id) {
-                    order.push(id);
+            // Lo que entra de la otra lista (o de la base) se pone justo después de lo que tenía antes en su lista, así un
+            // párrafo agregado en el medio del guion queda en el medio. Lo que estaba antes y ya no está en mi lista lo borré
+            // yo: entra al recorrido para decidir si la otra persona lo cambió.
+            let place = |order: &mut Vec<u64>, list: &[Value]| {
+                let ids: Vec<u64> = list.iter().filter_map(id_of).collect();
+                for (i, id) in ids.iter().enumerate() {
+                    if order.contains(id) {
+                        continue;
+                    }
+                    let at = i.checked_sub(1).and_then(|j| order.iter().position(|x| *x == ids[j])).map_or(0, |p| p + 1);
+                    order.insert(at, *id);
                 }
-            }
-            // Lo que estaba antes y ya no está en mi lista lo borré yo: entra al recorrido para decidir si la otra persona
-            // lo cambió.
-            for id in b.iter().filter_map(id_of) {
-                if !order.contains(&id) {
-                    order.push(id);
-                }
-            }
+            };
+            place(&mut order, &b);
+            place(&mut order, t);
+            // Un id que no usa ninguna de las listas, para las copias de «las dos».
+            let mut spare = m.iter().chain(t.iter()).chain(b.iter()).filter_map(id_of).max().unwrap_or(0);
             let mut out = Vec::new();
             for id in order {
                 let sub = format!("{path}#{id}");
-                if let Some(v) = merge_opt(
-                    find(&b, id).as_ref(),
-                    find(m, id).as_ref(),
-                    find(t, id).as_ref(),
-                    &sub,
-                    conflicts,
-                ) {
+                let before = cx.conflicts.len();
+                let merged = merge_opt(find(&b, id).as_ref(), find(m, id).as_ref(), find(t, id).as_ref(), &sub, cx);
+                let clashed = cx.conflicts.len() > before;
+                if clashed && cx.both {
+                    cx.conflicts.truncate(before);
+                    match (merged, find(t, id)) {
+                        // Se queda la mía y la de la otra persona va al lado, como una cosa nueva.
+                        (Some(mine_item), Some(mut their_item)) => {
+                            out.push(mine_item);
+                            spare += 1;
+                            if let Some(obj) = their_item.as_object_mut() {
+                                obj.insert("id".into(), json!(spare));
+                            }
+                            out.push(their_item);
+                        }
+                        // Yo la borré y la otra persona la cambió: se queda la suya.
+                        (None, Some(their_item)) => out.push(their_item),
+                        (Some(mine_item), None) => out.push(mine_item),
+                        (None, None) => {}
+                    }
+                    continue;
+                }
+                if let Some(v) = merged {
                     out.push(v);
                 }
             }
             Some(Value::Array(out))
         }
         _ => {
-            conflicts.push(path.to_string());
+            cx.conflicts.push(path.to_string());
             mine.cloned()
         }
     }
@@ -317,16 +431,26 @@ fn merge_opt(
 
 /// Combina una sección: lo que cambió cada uno sobre la base común. `Err` lleva los lugares donde los dos tocaron lo mismo.
 pub fn merge_section(base: &[u8], mine: &[u8], theirs: &[u8]) -> Result<Vec<u8>, Vec<String>> {
+    merge_with(base, mine, theirs, false)
+}
+
+/// Como `merge_section`, pero donde los dos tocaron la misma cosa de una lista se quedan las dos (la mía y la de la otra persona
+/// al lado). Solo falla si alguna de las dos copias no se puede leer.
+pub fn merge_section_both(base: &[u8], mine: &[u8], theirs: &[u8]) -> Result<Vec<u8>, Vec<String>> {
+    merge_with(base, mine, theirs, true)
+}
+
+fn merge_with(base: &[u8], mine: &[u8], theirs: &[u8], both: bool) -> Result<Vec<u8>, Vec<String>> {
     let parse = |b: &[u8]| serde_json::from_slice::<Value>(b).ok();
     let (Some(mine_v), Some(theirs_v)) = (parse(mine), parse(theirs)) else {
         return Err(vec!["la sección".to_string()]);
     };
     let base_v = parse(base);
-    let mut conflicts = Vec::new();
-    let merged = merge_opt(base_v.as_ref(), Some(&mine_v), Some(&theirs_v), "", &mut conflicts);
-    match (conflicts.is_empty(), merged) {
+    let mut cx = Merge { conflicts: Vec::new(), both };
+    let merged = merge_opt(base_v.as_ref(), Some(&mine_v), Some(&theirs_v), "", &mut cx);
+    match (cx.conflicts.is_empty() || both, merged) {
         (true, Some(v)) => Ok(pretty(&v)),
-        _ => Err(conflicts),
+        _ => Err(cx.conflicts),
     }
 }
 
@@ -866,5 +990,53 @@ mod tests {
         assert!(lines.contains(&"Borró un párrafo".to_string()), "{lines:?}");
         assert!(describe_change(&section_of_project(&base, "guion"), &section_of_project(&base, "guion"), 6).is_empty());
         assert_eq!(describe_change(b"no json", b"{}", 6), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_paragraph_added_by_the_other_person_keeps_its_place_in_the_merged_section() {
+        let base = br#"{"paragraphs":[{"id":1,"text":"uno"},{"id":2,"text":"dos"},{"id":3,"text":"tres"}]}"#;
+        let mine = br#"{"paragraphs":[{"id":1,"text":"uno"},{"id":2,"text":"dos"},{"id":3,"text":"tres editado"}]}"#;
+        let theirs = br#"{"paragraphs":[{"id":9,"text":"primero"},{"id":1,"text":"uno"},{"id":8,"text":"A"},{"id":10,"text":"B"},{"id":2,"text":"dos"},{"id":3,"text":"tres"}]}"#;
+        let texts = |out: Vec<u8>| -> Vec<String> {
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            v["paragraphs"].as_array().unwrap().iter().map(|p| p["text"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(texts(merge_section(base, mine, theirs).unwrap()), ["primero", "uno", "A", "B", "dos", "tres editado"]);
+        // Lo que agregué yo en otro lugar y lo que agregó la otra persona conviven.
+        let mine = br#"{"paragraphs":[{"id":1,"text":"uno"},{"id":2,"text":"dos"},{"id":3,"text":"tres"},{"id":20,"text":"final mio"}]}"#;
+        assert_eq!(texts(merge_section(base, mine, theirs).unwrap()), ["primero", "uno", "A", "B", "dos", "tres", "final mio"]);
+    }
+
+    #[test]
+    fn two_edits_in_different_places_of_the_same_paragraph_are_both_kept() {
+        assert_eq!(
+            merge_text("Ana abre la puerta despacio.", "Ana cierra la puerta despacio.", "Ana abre la puerta con cuidado."),
+            Some("Ana cierra la puerta con cuidado.".to_string())
+        );
+        // El mismo lugar, o uno pegado al otro, sigue siendo un conflicto.
+        assert_eq!(merge_text("Ana abre la puerta.", "Ana abre la ventana.", "Ana abre la reja."), None);
+        assert_eq!(merge_text("uno dos tres", "uno DOS tres", "uno dos TRES"), Some("uno DOS TRES".to_string()));
+        assert_eq!(merge_text("uno dos", "UNO DOS", "uno dos"), Some("UNO DOS".to_string()));
+        // En una sección entera: el mismo párrafo cambiado en dos lugares no es conflicto.
+        let base = br#"{"paragraphs":[{"id":1,"text":"Ana abre la puerta despacio."}]}"#;
+        let mine = br#"{"paragraphs":[{"id":1,"text":"Ana cierra la puerta despacio."}]}"#;
+        let theirs = br#"{"paragraphs":[{"id":1,"text":"Ana abre la puerta con cuidado."}]}"#;
+        let out = String::from_utf8(merge_section(base, mine, theirs).unwrap()).unwrap();
+        assert!(out.contains("Ana cierra la puerta con cuidado."), "{out}");
+    }
+
+    #[test]
+    fn keeping_both_versions_leaves_mine_in_place_and_the_other_one_right_after() {
+        let base = br#"{"paragraphs":[{"id":1,"text":"Ana abre la puerta."},{"id":2,"text":"Fin."}]}"#;
+        let mine = br#"{"paragraphs":[{"id":1,"text":"Ana abre la ventana."},{"id":2,"text":"Fin."}]}"#;
+        let theirs = br#"{"paragraphs":[{"id":1,"text":"Ana abre la reja."},{"id":2,"text":"Fin."}]}"#;
+        assert!(merge_section(base, mine, theirs).is_err());
+        let out = merge_section_both(base, mine, theirs).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let list = v["paragraphs"].as_array().unwrap();
+        let texts: Vec<&str> = list.iter().map(|p| p["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["Ana abre la ventana.", "Ana abre la reja.", "Fin."]);
+        let ids: std::collections::BTreeSet<u64> = list.iter().map(|p| p["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids.len(), 3, "la copia lleva un id propio");
     }
 }

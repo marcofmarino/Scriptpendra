@@ -70,7 +70,7 @@ const PEER_SIZE: f32 = 26.0;
 
 /// Las personas conectadas al proyecto, contra el borde derecho de la fila del título: un círculo con la inicial de cada una (del
 /// color de su nombre). Al pasar el mouse dice quién es y dónde está; al hacer clic devuelve la pantalla en la que está.
-fn peers_row(ui: &mut Ui, p: &Palette, peers: &[Peer]) -> Option<String> {
+fn peers_row(ui: &mut Ui, p: &Palette, peers: &[Peer], place: &(String, String)) -> Option<String> {
     let mut goto = None;
     let hidden = peers.len().saturating_sub(PEERS_SHOWN);
     ui.spacing_mut().item_spacing.x = SP_XS;
@@ -103,12 +103,22 @@ fn peers_row(ui: &mut Ui, p: &Palette, peers: &[Peer]) -> Option<String> {
             egui::FontId::new(FONT_SMALL, theme::bold_family()),
             theme::ink_on(color, p),
         );
+        // En la misma escena que yo: lo más probable es que se pisen, se marca con un punto de aviso.
+        let same = !peer.detail.is_empty() && peer.screen == place.0 && peer.detail == place.1;
+        if same {
+            let dot = rect.right_top() + egui::vec2(-3.0, 4.0);
+            ui.painter().circle_filled(dot, 5.5, p.panel);
+            ui.painter().circle_filled(dot, 4.0, p.warning);
+        }
         let place = match (peer.screen.is_empty(), peer.detail.is_empty()) {
             (true, _) => String::new(),
             (false, true) => peer.screen.clone(),
             (false, false) => format!("{} · {}", peer.screen, peer.detail),
         };
-        let tip = if place.is_empty() { name.to_string() } else { format!("{name}\n{place}  (clic para ir)") };
+        let mut tip = if place.is_empty() { name.to_string() } else { format!("{name}\n{place}  (clic para ir)") };
+        if same {
+            tip.push_str("\nEstá en la misma escena que vos: conviene hablar antes de editar lo mismo.");
+        }
         let resp = resp.on_hover_text(tip);
         if !peer.screen.is_empty() {
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -485,6 +495,8 @@ pub struct ShellFlags<'a> {
     pub page_key: &'a str,
     /// Quién más está en el proyecto compartido (arriba a la derecha).
     pub peers: &'a [Peer],
+    /// Dónde estoy yo (pantalla y detalle, por ejemplo «escena 3»), para marcar a quien esté en el mismo lugar.
+    pub place: &'a (String, String),
 }
 
 /// Lo que devuelve el marco.
@@ -542,7 +554,7 @@ pub fn show_screen(
                 kit::screen_title(ui, p, &title);
             }
         },
-        |ui| out.goto_screen = peers_row(ui, p, flags.peers),
+        |ui| out.goto_screen = peers_row(ui, p, flags.peers, flags.place),
     );
     let history = History {
         can_undo: screen.can_undo(cx),

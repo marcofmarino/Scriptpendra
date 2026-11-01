@@ -343,6 +343,19 @@ struct Conflict {
     section: String,
     /// Cómo la dejó la otra persona.
     theirs: Vec<u8>,
+    /// Qué cambió cada lado sobre lo que tenían en común, en frases cortas, y quién es la otra persona.
+    mine_lines: Vec<String>,
+    their_lines: Vec<String>,
+    who: String,
+}
+
+/// Con cuál versión de una sección en conflicto se queda la persona.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Keep {
+    Mine,
+    Theirs,
+    /// Las dos: lo que tocaron ambos queda con la mía y la de la otra persona al lado.
+    Both,
 }
 
 /// Un aviso de que otra persona cambió algo: quién, qué parte y qué cambió.
@@ -421,6 +434,11 @@ pub struct ScriptApp {
     cloud_link: Option<CloudLink>,
     /// Quién más está en el proyecto compartido (se renueva cada pocos segundos).
     peers: Vec<crate::cloud::Peer>,
+    /// Cambios del proyecto compartido que todavía no se subieron, y cuándo se contaron por última vez.
+    pending: usize,
+    pending_at: f64,
+    /// A quién ya se avisó que está en la misma escena que yo.
+    same_place_told: String,
     /// Avisos de lo que cambiaron otras personas.
     change_toasts: Vec<ChangeToast>,
     /// Lo último que se leyó o se escribió de la carpeta del proyecto, por sección: la base para combinar cambios.
@@ -519,6 +537,9 @@ impl ScriptApp {
             cloud: Default::default(),
             cloud_link: None,
             peers: Vec::new(),
+            pending: 0,
+            pending_at: f64::NEG_INFINITY,
+            same_place_told: String::new(),
             change_toasts: Vec::new(),
             known: Default::default(),
             stamps: Default::default(),
@@ -776,7 +797,7 @@ impl ScriptApp {
         };
         self.status = match std::fs::write(
             &path,
-            crate::docx::export(&self.project, self.settings.paper),
+            crate::docx::export(&self.project, self.settings.paper, self.settings.bold_names),
         ) {
             Ok(()) => "Exportado a Word".into(),
             Err(e) => format!("Error al exportar: {e}"),
@@ -1014,7 +1035,8 @@ impl ScriptApp {
         // Lo que llega de otra persona no puede apuntar a archivos de esta computadora.
         new.drop_foreign_image_paths();
         new.base_dir = self.project.base_dir.clone();
-        new.normalize();
+        // Lo que llega de otra persona no crea fichas: quien escribe un personaje todavía puede estar a mitad del nombre.
+        new.normalize_incoming();
         new.use_id_block(self.settings.user_id);
         self.project = new;
         self.editor.resync_snapshot(&self.project);
@@ -1078,7 +1100,15 @@ impl ScriptApp {
                         combined = true;
                     }
                     Err(_) => {
-                        self.conflicts.push(Conflict { section: name, theirs: theirs.clone() });
+                        let base = base.map_or(&empty[..], |b| b.as_slice());
+                        let mine_lines = folder::describe_change(base, mine.get(&name).map_or(&empty[..], |b| b.as_slice()), 4);
+                        self.conflicts.push(Conflict {
+                            section: name,
+                            theirs: theirs.clone(),
+                            mine_lines,
+                            their_lines: lines,
+                            who,
+                        });
                         continue;
                     }
                 }
@@ -1113,13 +1143,13 @@ impl ScriptApp {
         }
     }
 
-    /// Resuelve un conflicto: me quedo con mi versión de la sección o con la de la otra persona. Lo que se descarta queda
-    /// guardado en el historial.
-    fn resolve_conflict(&mut self, index: usize, keep_mine: bool) {
+    /// Resuelve un conflicto: me quedo con mi versión de la sección, con la de la otra persona o con las dos. Lo que se
+    /// descarta queda guardado en el historial.
+    fn resolve_conflict(&mut self, index: usize, keep: Keep) {
         if index >= self.conflicts.len() {
             return;
         }
-        let Conflict { section, theirs } = self.conflicts.remove(index);
+        let Conflict { section, theirs, .. } = self.conflicts.remove(index);
         let Some(file) = self.path.clone() else {
             return;
         };
@@ -1128,53 +1158,93 @@ impl ScriptApp {
         let Ok(mut sections) = folder::split(&self.project) else {
             return;
         };
-        if keep_mine {
-            // Lo de la otra persona queda como una versión del historial antes de pisarlo.
-            let mut theirs_sections = sections.clone();
-            theirs_sections.insert(section.clone(), theirs.clone());
-            if let Ok(project) = folder::join(&theirs_sections) {
-                let _ = folder::snapshot(&project, &file, "Otra persona", "Antes de pisar su cambio", false, now);
+        match keep {
+            Keep::Mine => {
+                // Lo de la otra persona queda como una versión del historial antes de pisarlo.
+                let mut theirs_sections = sections.clone();
+                theirs_sections.insert(section.clone(), theirs.clone());
+                if let Ok(project) = folder::join(&theirs_sections) {
+                    let _ = folder::snapshot(&project, &file, "Otra persona", "Antes de pisar su cambio", false, now);
+                }
+                self.known.insert(section, theirs);
+                self.dirty = true;
             }
-            self.known.insert(section, theirs);
-            self.dirty = true;
-        } else {
-            let _ = folder::snapshot(&self.project, &file, &author, "Antes de aceptar el cambio de otra persona", false, now);
-            sections.insert(section.clone(), theirs.clone());
-            if let Ok(new) = folder::join(&sections) {
-                self.replace_project(new);
+            Keep::Theirs => {
+                let _ = folder::snapshot(&self.project, &file, &author, "Antes de aceptar el cambio de otra persona", false, now);
+                sections.insert(section.clone(), theirs.clone());
+                if let Ok(new) = folder::join(&sections) {
+                    self.replace_project(new);
+                }
+                self.known.insert(section, theirs);
             }
-            self.known.insert(section, theirs);
+            Keep::Both => {
+                let _ = folder::snapshot(&self.project, &file, &author, "Antes de juntar las dos versiones", false, now);
+                let empty = b"{}".to_vec();
+                let base = self.known.get(&section).cloned().unwrap_or_else(|| empty.clone());
+                let mine = sections.get(&section).cloned().unwrap_or(empty);
+                if let Ok(bytes) = folder::merge_section_both(&base, &mine, &theirs) {
+                    sections.insert(section.clone(), bytes);
+                    if let Ok(new) = folder::join(&sections) {
+                        self.replace_project(new);
+                    }
+                }
+                self.known.insert(section, theirs);
+                self.dirty = true;
+            }
         }
     }
 
-    /// La ventana de conflictos: una sección cambió a la vez acá y en otra copia.
+    /// La ventana de conflictos: una cosa cambió a la vez acá y en otra copia. Cada conflicto muestra, lado a lado, lo que
+    /// cambió cada uno.
     fn conflicts_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
         if self.conflicts.is_empty() || !self.conflicts_open {
             return;
         }
-        let mut choice: Option<(usize, bool)> = None;
+        let mut choice: Option<(usize, Keep)> = None;
         let mut later = false;
-        let names: Vec<&str> = self.conflicts.iter().map(|c| section_name(&c.section)).collect();
+        let conflicts = &self.conflicts;
         kit::dialog(
             ctx,
             p,
             "conflicts",
             "Cambió lo mismo en dos copias",
-            kit::DialogWidth::Normal,
+            kit::DialogWidth::Wide,
             |ui| {
-                ui.label("Otra persona y vos cambiaron lo mismo. ¿Con cuál te quedás? La que no elijas queda guardada en las versiones anteriores.");
-                ui.add_space(tokens::SP_S);
-                for (i, name) in names.iter().enumerate() {
-                    ui.label(RichText::new(*name).font(egui::FontId::new(tokens::FONT_BODY, theme::bold_family())));
-                    ui.horizontal(|ui| {
-                        if ui.button("Con mis cambios").clicked() {
-                            choice = Some((i, true));
-                        }
-                        if ui.button("Con los de la otra persona").clicked() {
-                            choice = Some((i, false));
+                ui.label("Otra persona y vos cambiaron lo mismo. Mirá qué hizo cada uno y elegí con cuál te quedás. Lo que no elijas queda guardado en las versiones anteriores.");
+                for (i, c) in conflicts.iter().enumerate() {
+                    ui.add_space(tokens::SP_M);
+                    ui.label(RichText::new(section_name(&c.section)).font(egui::FontId::new(tokens::FONT_CARD_TITLE, theme::bold_family())));
+                    ui.add_space(tokens::SP_XS);
+                    ui.columns(2, |cols| {
+                        for (col, (title, lines)) in cols.iter_mut().zip([("Tus cambios", &c.mine_lines), (c.who.as_str(), &c.their_lines)]) {
+                            kit::card(col, p, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(RichText::new(title).size(tokens::FONT_SMALL).color(p.dim));
+                                if lines.is_empty() {
+                                    ui.label(RichText::new("Cambios sin descripción").color(p.dim));
+                                }
+                                for line in lines.iter() {
+                                    ui.add(egui::Label::new(line.as_str()).wrap());
+                                }
+                            });
                         }
                     });
                     ui.add_space(tokens::SP_XS);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Quedarme con los míos").clicked() {
+                            choice = Some((i, Keep::Mine));
+                        }
+                        if ui.button("Quedarme con los suyos").clicked() {
+                            choice = Some((i, Keep::Theirs));
+                        }
+                        if ui
+                            .button("Quedarme con los dos")
+                            .on_hover_text("Lo que tocaron los dos queda con tu versión y la suya al lado, como un párrafo o una fila más")
+                            .clicked()
+                        {
+                            choice = Some((i, Keep::Both));
+                        }
+                    });
                 }
             },
             |ui| {
@@ -1183,8 +1253,8 @@ impl ScriptApp {
                 }
             },
         );
-        if let Some((i, mine)) = choice {
-            self.resolve_conflict(i, mine);
+        if let Some((i, keep)) = choice {
+            self.resolve_conflict(i, keep);
         }
         if later {
             self.conflicts_open = false;
@@ -2633,6 +2703,7 @@ impl ScriptApp {
                 panel_default: 0.0,
                 page_key: &key,
                 peers: &[],
+                place: &(String::new(), String::new()),
             };
             shell::show_screen(ui, &mut screen, &mut cx, flags);
         }
@@ -2773,13 +2844,27 @@ impl ScriptApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui, page: &Page, p: &Palette) {
-        let saved = if self.dirty {
+        let mut saved = if self.dirty {
             "Cambios sin guardar"
         } else if self.path.is_some() {
             "Guardado"
         } else {
             "Sin guardar"
-        };
+        }
+        .to_string();
+        // En un proyecto compartido: si no hay conexión y cuántos cambios esperan para subirse.
+        if self.cloud_link.is_some() {
+            let waiting = self.cloud.offline() || self.cloud.account().is_none();
+            if self.cloud.offline() {
+                saved.push_str("  ·  Sin conexión");
+            } else if self.cloud.account().is_none() {
+                saved.push_str("  ·  Sin sesión");
+            }
+            // Con la nube al día los cambios se suben en segundos: solo se cuentan cuando esperan de verdad.
+            if waiting && self.pending > 0 {
+                saved.push_str(&format!("  ·  {} sin subir", self.pending));
+            }
+        }
         let info = self.page_info(page);
         let message = self.last_message.clone();
         // Los botones de la barra lateral y del inspector viven en la barra de estado (interfaz.md §1.5).
@@ -2795,7 +2880,7 @@ impl ScriptApp {
             ui,
             p,
             shell::Status {
-                saved,
+                saved: &saved,
                 message: &message,
                 info: &info,
                 sidebar: &mut sidebar,
@@ -2898,6 +2983,23 @@ impl ScriptApp {
         let key = page.key();
         let panel_id = Self::inspector_id(page).unwrap_or("no_inspector");
         let panel_default = self.panel_default(panel_id, PanelSide::Right);
+        // Si alguien más está en la misma escena, se avisa una vez (el punto naranja de su círculo queda mientras sigan ahí).
+        let here = self.presence_of(page);
+        let together: Vec<&str> = self
+            .peers
+            .iter()
+            .filter(|x| self.cloud_link.is_some() && !here.1.is_empty() && x.screen == here.0 && x.detail == here.1)
+            .map(|x| if x.who.is_empty() { "Alguien" } else { x.who.as_str() })
+            .collect();
+        let together_key = together.join(", ") + &here.1;
+        if together.is_empty() {
+            self.same_place_told.clear();
+        } else if self.same_place_told != together_key {
+            if self.settings.notifications {
+                self.status = format!("{} también está en la {}: conviene hablar antes de editar lo mismo.", together.join(", "), here.1);
+            }
+            self.same_place_told = together_key;
+        }
         let history: Vec<String> = self.history.iter().map(|h| h.key()).collect();
         let mut tab = self.inspector_tabs.get(&key).copied().unwrap_or(0);
         let compact = self.compact_inspector;
@@ -2930,6 +3032,7 @@ impl ScriptApp {
             panel_default,
             page_key: &key,
             peers: if self.cloud_link.is_some() { &self.peers } else { &[] },
+            place: &here,
         };
         let mut out = match page {
             Page::Info => shell::show_screen(ui, &mut InfoScreen, &mut cx, flags),
@@ -3613,7 +3716,7 @@ impl ScriptApp {
         for card in &mut self.cards {
             if let Some(badge) = &mut card.cloud {
                 badge.group = self.cloud.group_name(&badge.group_id).unwrap_or_default().to_string();
-                badge.syncing = downloading.as_deref() == Some(badge.project_id.as_str());
+                badge.state = self.cloud.state_of(&badge.group_id, downloading.as_deref() == Some(badge.project_id.as_str()));
             }
         }
         let remote: Vec<crate::pages::RemoteCard> = self
@@ -3794,7 +3897,17 @@ impl ScriptApp {
                 }
                 let fast = !self.peers.is_empty() || now - self.last_edit < 20.0;
                 let out = self.cloud.tick(&ctx, now, &self.settings, file.as_deref(), link.as_ref(), fast);
+                let synced = out.synced;
                 self.apply_cloud(out);
+                // Cuántos cambios quedan sin subir (se cuenta al terminar una sincronización y cada tanto).
+                match (&file, &link) {
+                    (Some(f), Some(_)) if synced || now - self.pending_at > 3.0 => {
+                        self.pending_at = now;
+                        self.pending = crate::cloudsync::pending_changes(f);
+                    }
+                    (_, None) => self.pending = 0,
+                    _ => {}
+                }
                 // Dónde estoy, para que los demás lo vean.
                 let (screen, detail) = self.presence_of(&page);
                 let who = self.author_name();
@@ -3836,6 +3949,46 @@ mod tests {
     use crate::ui::checks;
 
     /// Recorre todas las pantallas en un contexto sin ventana para detectar paneos de layout.
+    /// La lista de secciones de Ajustes se puede clicar (las filas llegaron a medir cero de ancho y solo se veía «Apariencia»).
+    #[test]
+    fn the_settings_sections_can_be_clicked_and_show_the_paper_choice() {
+        let ctx = egui::Context::default();
+        let mut app = ScriptApp::new(&ctx);
+        theme::apply(&ctx, &app.settings.scheme.palette(), 100);
+        let mut time = 0.0;
+        let mut frame = |app: &mut ScriptApp, events: Vec<egui::Event>| {
+            time += 0.5;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                time: Some(time),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.draw(ui));
+            out.textures_delta.clear();
+            out
+        };
+        let text_pos = |out: &egui::FullOutput, wanted: &str| {
+            out.shapes.iter().find_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text() == wanted => Some(t.pos + egui::vec2(10.0, 8.0)),
+                _ => None,
+            })
+        };
+        frame(&mut app, vec![]);
+        app.show_settings = true;
+        frame(&mut app, vec![]);
+        let out = frame(&mut app, vec![]);
+        assert!(text_pos(&out, "PAPEL").is_none());
+        let pos = text_pos(&out, "Guion").expect("la sección Guion está en la lista");
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+        frame(&mut app, vec![button(true)]);
+        frame(&mut app, vec![button(false)]);
+        let out = frame(&mut app, vec![]);
+        assert!(text_pos(&out, "PAPEL").is_some(), "al elegir Guion aparece el papel");
+    }
+
     #[test]
     fn every_screen_draws() {
         draw_everything(theme::Scheme::default(), egui::vec2(1280.0, 800.0), 100);
@@ -4141,7 +4294,8 @@ mod tests {
                     group_id: String::new(),
                     project_id: String::new(),
                     group: "Un grupo con un nombre bastante largo para la tarjeta".into(),
-                    syncing: true,
+                    state: storage::CloudState::Syncing,
+                    pending: 3,
                 }),
             },
             RecentCard {
@@ -5368,11 +5522,48 @@ mod tests {
         app.save(false);
         assert!(app.dirty, "con un conflicto sin resolver no se guarda");
         // Me quedo con la mía: lo de la otra persona queda en el historial.
-        app.resolve_conflict(0, true);
+        app.resolve_conflict(0, Keep::Mine);
         app.save(false);
         assert!(!app.dirty);
         assert_eq!(folder::load(&file).unwrap().paragraphs[1].text, "Ana se asoma.");
         assert!(folder::list(&file).iter().any(|v| v.author == "Otra persona"));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_conflict_shows_what_each_side_did_and_keeping_both_leaves_the_two_versions() {
+        let (mut app, file) = shared_project("both");
+        app.project.paragraphs[1].text = "Ana se asoma.".into();
+        app.dirty = true;
+        other_person_edits(&file, "Ana abre la puerta.", "Ana sale corriendo.");
+        app.poll_external(true);
+        assert_eq!(app.conflicts.len(), 1);
+        let c = &app.conflicts[0];
+        assert!(c.mine_lines.iter().any(|l| l.contains("Ana se asoma.")), "{:?}", c.mine_lines);
+        assert!(c.their_lines.iter().any(|l| l.contains("Ana sale corriendo.")), "{:?}", c.their_lines);
+        // La ventana se dibuja con las dos columnas.
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, &app.settings.scheme.palette(), 100);
+        let palette = app.settings.scheme.palette();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                focused: true,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |_| app.conflicts_dialog(&ctx, &palette));
+            out.textures_delta.clear();
+        }
+        app.resolve_conflict(0, Keep::Both);
+        assert!(app.conflicts.is_empty());
+        let texts: Vec<&str> = app.project.paragraphs.iter().map(|p| p.text.as_str()).collect();
+        assert!(texts.contains(&"Ana se asoma.") && texts.contains(&"Ana sale corriendo."), "{texts:?}");
+        let (mine, theirs) = (
+            texts.iter().position(|t| *t == "Ana se asoma.").unwrap(),
+            texts.iter().position(|t| *t == "Ana sale corriendo.").unwrap(),
+        );
+        assert_eq!(theirs, mine + 1, "la suya queda justo al lado");
+        assert!(app.dirty, "lo juntado hay que guardarlo");
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 }
