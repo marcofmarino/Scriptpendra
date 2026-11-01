@@ -30,6 +30,9 @@ create table if not exists public.profiles (
   created_at timestamptz not null default now()
 );
 
+-- Dos personas no pueden tener el mismo nombre (sin distinguir mayúsculas): así nadie se hace pasar por otra.
+create unique index if not exists profiles_display_name_unique on public.profiles (lower(display_name)) where display_name <> '';
+
 create table if not exists public.admins (
   user_id uuid primary key references auth.users (id) on delete cascade
 );
@@ -87,6 +90,8 @@ create table if not exists public.sections (
   updated_at timestamptz not null default now(),
   primary key (project_id, name)
 );
+-- El nombre (el que registró el servidor) de la persona que subió la última versión, para avisar «Ana cambió el guion».
+alter table public.sections add column if not exists updated_who text not null default '' check (char_length(updated_who) <= 60);
 
 -- Las imágenes de un proyecto: el archivo vive en Storage (bucket privado `images`); esta tabla lleva la cuenta de lo que ocupa
 -- cada grupo, y es lo que decide si se puede subir otra.
@@ -125,7 +130,6 @@ alter default privileges in schema public revoke execute on functions from publi
 
 grant select on public.profiles, public.groups, public.memberships, public.projects, public.sections, public.images
   to authenticated;
-grant insert, update on public.profiles to authenticated;
 grant delete on public.memberships to authenticated;
 
 alter table public.profiles enable row level security;
@@ -194,12 +198,9 @@ $$;
 drop policy if exists profiles_read on public.profiles;
 create policy profiles_read on public.profiles for select to authenticated
   using (id = auth.uid() or public.shares_group_with(id));
+-- El perfil no se escribe directo: el nombre se elige una sola vez con `set_display_name`.
 drop policy if exists profiles_insert on public.profiles;
-create policy profiles_insert on public.profiles for insert to authenticated
-  with check (id = auth.uid());
 drop policy if exists profiles_update on public.profiles;
-create policy profiles_update on public.profiles for update to authenticated
-  using (id = auth.uid()) with check (id = auth.uid());
 
 drop policy if exists admins_read on public.admins;
 create policy admins_read on public.admins for select to authenticated using (user_id = auth.uid());
@@ -230,6 +231,50 @@ create policy images_read on public.images for select to authenticated using (pu
 -- ------------------------------------------------------------------------------------------------
 -- Escrituras: solo por funciones que validan en el servidor
 -- ------------------------------------------------------------------------------------------------
+
+-- El nombre de la persona, tal como lo registró el servidor (nunca el que diga el programa).
+create or replace function public.my_name()
+returns text language sql stable security definer set search_path = '' as $$
+  select coalesce(nullif((select p.display_name from public.profiles p where p.id = auth.uid()), ''), 'Alguien');
+$$;
+
+-- Elige el nombre de la persona. Se puede hacer UNA sola vez y no se puede cambiar después (para que nadie cambie de identidad),
+-- tiene que ser único y de 3 a 30 letras, números, espacios, puntos, guiones o guiones bajos.
+create or replace function public.set_display_name(new_name text)
+returns text language plpgsql security definer set search_path = '' as $$
+declare
+  uid uuid := auth.uid();
+  n text := btrim(coalesce(new_name, ''));
+  current_name text;
+begin
+  if uid is null then raise exception 'sin sesión' using errcode = '28000'; end if;
+  if char_length(n) not between 3 and 30
+     or n !~ '^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9][A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9 ._-]*[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]$'
+     or n ~ '  ' then
+    raise exception 'nombre inválido' using errcode = '22023';
+  end if;
+  if lower(n) in ('admin', 'administrador', 'soporte', 'sistema', 'scriptpendra', 'moderador', 'alguien') then
+    raise exception 'nombre reservado' using errcode = '22023';
+  end if;
+  insert into public.profiles (id) values (uid) on conflict do nothing;
+  select p.display_name into current_name from public.profiles p where p.id = uid for update;
+  if current_name <> '' then raise exception 'el nombre ya está elegido' using errcode = '42501'; end if;
+  update public.profiles set display_name = n where id = uid;  -- si ya lo usa otra persona: error 23505
+  return n;
+end $$;
+
+-- Aunque alguien lograra escribir en la tabla, un nombre ya elegido no cambia (solo quien administra, desde el SQL Editor).
+create or replace function public.keep_display_name()
+returns trigger language plpgsql set search_path = '' as $$
+begin
+  if auth.uid() is not null and old.display_name <> '' and new.display_name is distinct from old.display_name then
+    raise exception 'el nombre ya está elegido' using errcode = '42501';
+  end if;
+  return new;
+end $$;
+drop trigger if exists keep_display_name on public.profiles;
+create trigger keep_display_name before update on public.profiles
+  for each row execute function public.keep_display_name();
 
 -- Crea un grupo y deja a quien lo crea como dueño. Máximo 5 grupos por persona.
 create or replace function public.create_group(group_name text)
@@ -313,7 +358,8 @@ end $$;
 
 -- Sube una sección solo si nadie escribió desde la versión que se leyó (`base_version`; 0 si la sección es nueva). Si alguien
 -- se adelantó devuelve el error 40001 y el programa trae lo nuevo, combina y vuelve a intentar. Devuelve la versión nueva.
-create or replace function public.push_section(pid uuid, section text, base_version bigint, new_content text)
+drop function if exists public.push_section(uuid, text, bigint, text);
+create or replace function public.push_section(pid uuid, section text, base_version bigint, new_content text, p_who text default '')
 returns bigint language plpgsql security definer set search_path = '' as $$
 declare
   current_version bigint;
@@ -333,14 +379,15 @@ begin
     if (select count(*) from public.sections s where s.project_id = pid) >= 20 then
       raise exception 'demasiadas secciones' using errcode = '53400';
     end if;
-    insert into public.sections (project_id, name, content, version, updated_by)
-    values (pid, section, new_content, 1, auth.uid());
+    insert into public.sections (project_id, name, content, version, updated_by, updated_who)
+    values (pid, section, new_content, 1, auth.uid(), public.my_name());
     return 1;
   end if;
   if current_version <> base_version then raise exception 'conflicto' using errcode = '40001'; end if;
   next_version := current_version + 1;
   update public.sections
-  set content = new_content, version = next_version, updated_by = auth.uid(), updated_at = now()
+  set content = new_content, version = next_version, updated_by = auth.uid(), updated_at = now(),
+      updated_who = public.my_name()
   where project_id = pid and name = section;
   return next_version;
 end $$;
@@ -422,7 +469,7 @@ begin
   if not public.is_member(public.project_group(pid)) then raise exception 'no permitido' using errcode = '42501'; end if;
   delete from public.presence p where p.project_id = pid and p.updated_at < now() - interval '1 day';
   insert into public.presence (project_id, user_id, who, screen, detail, updated_at)
-  values (pid, auth.uid(), left(coalesce(p_who, ''), 60), left(coalesce(p_screen, ''), 40), left(coalesce(p_detail, ''), 120), now())
+  values (pid, auth.uid(), public.my_name(), left(coalesce(p_screen, ''), 40), left(coalesce(p_detail, ''), 120), now())
   on conflict (project_id, user_id) do update
     set who = excluded.who, screen = excluded.screen, detail = excluded.detail, updated_at = excluded.updated_at;
 end $$;
@@ -439,6 +486,15 @@ begin
     order by p.who;
 end $$;
 
+-- Un número que cambia cada vez que alguien sube algo al proyecto (la suma de las versiones de sus secciones): sirve para preguntar
+-- «¿hubo cambios?» con una respuesta de unos pocos bytes en lugar de traer la lista de secciones.
+create or replace function public.project_stamp(pid uuid)
+returns bigint language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_member(public.project_group(pid)) then raise exception 'no permitido' using errcode = '42501'; end if;
+  return (select coalesce(sum(s.version), 0)::bigint from public.sections s where s.project_id = pid);
+end $$;
+
 -- Cada función solo la puede llamar quien inició sesión (nunca `anon`). Postgres da EXECUTE a todo el mundo (PUBLIC) por defecto:
 -- hay que quitarlo de cada función ya creada, y recién después darlo a `authenticated`.
 revoke all on all functions in schema public from public, anon, authenticated;
@@ -446,10 +502,11 @@ alter default privileges revoke execute on functions from public;
 grant execute on function public.is_member(uuid), public.is_owner(uuid), public.is_admin(),
   public.project_group(uuid), public.shares_group_with(uuid),
   public.create_group(text), public.create_invite(uuid), public.join_group(text),
-  public.create_project(uuid, text), public.push_section(uuid, text, bigint, text),
+  public.create_project(uuid, text), public.push_section(uuid, text, bigint, text, text),
   public.reserve_image(uuid, text, text, bigint), public.release_image(uuid, text),
+  public.my_name(), public.set_display_name(text),
   public.group_usage(uuid), public.admin_usage(), public.admin_set_quota(uuid, bigint),
-  public.set_presence(uuid, text, text, text), public.project_presence(uuid)
+  public.set_presence(uuid, text, text, text), public.project_presence(uuid), public.project_stamp(uuid)
   to authenticated;
 
 -- El perfil se crea solo al registrarse.

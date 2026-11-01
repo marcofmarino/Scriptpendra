@@ -128,6 +128,8 @@ pub struct Status<'a> {
     pub sidebar: &'a mut bool,
     /// El botón que muestra u oculta el inspector, en el extremo derecho (solo en pantallas que tienen).
     pub inspector: Option<&'a mut bool>,
+    /// La campanita: si se muestran los avisos de lo que cambian otras personas.
+    pub notifications: &'a mut bool,
 }
 
 /// Un botón de la barra de estado: del alto de la barra, con el fundido de pasar el mouse.
@@ -168,6 +170,7 @@ pub fn status_bar(ui: &mut Ui, p: &Palette, status: Status) {
                 info,
                 sidebar,
                 inspector,
+                notifications,
             } = status;
             ui.columns(3, |cols| {
                 cols[0].with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -202,6 +205,17 @@ pub fn status_bar(ui: &mut Ui, p: &Palette, status: Status) {
                         .clicked()
                     {
                         *inspector = !*inspector;
+                    }
+                    if status_button(
+                        ui,
+                        p,
+                        if *notifications { icon::BELL } else { icon::BELL_SLASH },
+                        if *notifications { "Silenciar los avisos de cambios" } else { "Activar los avisos de cambios" },
+                        *notifications,
+                    )
+                    .clicked()
+                    {
+                        *notifications = !*notifications;
                     }
                     ui.add(egui::Label::new(small(info)).truncate());
                 });

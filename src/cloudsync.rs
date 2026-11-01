@@ -33,6 +33,9 @@ pub struct CloudLink {
     pub project: String,
     /// La versión de cada sección en la nube la última vez que se sincronizó.
     pub versions: BTreeMap<String, i64>,
+    /// Quién subió la última versión que se trajo de cada sección (para avisar «Ana cambió el guion»).
+    #[serde(default)]
+    pub authors: BTreeMap<String, String>,
 }
 
 fn link_path(file: &Path) -> PathBuf {
@@ -144,13 +147,19 @@ pub fn pull<T: Transport>(
     if link.url != client.url() {
         return Err(CloudError::Invalid("El proyecto está unido a otra nube.".into()).into());
     }
+    // Primero una pregunta mínima: si el número del proyecto es el que ya conocemos, no hay nada que traer y se evita bajar la lista.
+    let known: i64 = link.versions.values().sum();
+    if !link.versions.is_empty() && client.project_stamp(&link.project)? == known {
+        return Ok(());
+    }
     let remote = client.section_versions(&link.project)?;
     let dir = folder::data_dir(file);
     fs::create_dir_all(&dir)?;
-    for (name, version) in remote {
+    for (name, version, who) in remote {
         if link.versions.get(&name) == Some(&version) {
             continue;
         }
+        link.authors.insert(name.clone(), who);
         let (content, version) = client.section(&link.project, &name)?;
         let disk = fs::read(section_path(file, &name)).ok();
         let base = fs::read(base_path(file, &name)).ok();
@@ -191,6 +200,7 @@ pub fn push<T: Transport>(
     file: &Path,
     link: &mut CloudLink,
     report: &mut Report,
+    who: &str,
 ) -> Result<(), SyncError> {
     for (name, bytes) in folder::read_sections(file)? {
         if !cloud::is_section_name(&name) || bytes.len() > cloud::MAX_SECTION_BYTES {
@@ -200,7 +210,7 @@ pub fn push<T: Transport>(
             continue;
         }
         let base_version = link.versions.get(&name).copied().unwrap_or(0);
-        match client.push_section(&link.project, &name, base_version, &bytes) {
+        match client.push_section(&link.project, &name, base_version, &bytes, who) {
             Ok(version) => {
                 write_base(file, &name, &bytes)?;
                 link.versions.insert(name.clone(), version);
@@ -222,10 +232,11 @@ pub fn sync_once<T: Transport>(
     client: &mut Client<T>,
     file: &Path,
     link: &mut CloudLink,
+    who: &str,
 ) -> Result<Report, SyncError> {
     let mut report = Report::default();
     pull(client, file, link, &mut report)?;
-    push(client, file, link, &mut report)?;
+    push(client, file, link, &mut report, who)?;
     Ok(report)
 }
 
@@ -235,6 +246,7 @@ pub fn share_project<T: Transport>(
     group: &str,
     name: &str,
     file: &Path,
+    who: &str,
 ) -> Result<CloudLink, SyncError> {
     let project = client.create_project(group, name)?;
     let mut link = CloudLink {
@@ -242,9 +254,10 @@ pub fn share_project<T: Transport>(
         group: group.to_string(),
         project,
         versions: BTreeMap::new(),
+        authors: BTreeMap::new(),
     };
     let mut report = Report::default();
-    push(client, file, &mut link, &mut report)?;
+    push(client, file, &mut link, &mut report, who)?;
     Ok(link)
 }
 
@@ -263,6 +276,7 @@ pub fn download_project<T: Transport>(
         group: group.to_string(),
         project: project.to_string(),
         versions: BTreeMap::new(),
+        authors: BTreeMap::new(),
     };
     let mut report = Report::default();
     pull(client, file, &mut link, &mut report)?;
@@ -288,6 +302,9 @@ mod tests {
     #[derive(Default)]
     struct Server {
         sections: BTreeMap<String, (String, i64)>,
+        who: BTreeMap<String, String>,
+        /// Los caminos que se pidieron, para comprobar cuánto se habla con el servidor.
+        calls: Vec<String>,
     }
 
     #[derive(Clone)]
@@ -297,7 +314,9 @@ mod tests {
         fn send(&self, r: &Request) -> Result<Response, CloudError> {
             let reply = |status: u16, v: Value| Ok(Response { status, body: v.to_string().into_bytes() });
             let mut server = self.0.lock().unwrap();
+            server.calls.push(r.path.clone());
             match (r.method, r.path.as_str()) {
+                (Method::Post, "/rest/v1/rpc/project_stamp") => reply(200, json!(server.sections.values().map(|(_, v)| *v).sum::<i64>())),
                 (Method::Post, "/auth/v1/token") => reply(
                     200,
                     json!({"access_token": "t", "refresh_token": "r", "expires_in": 3600, "user": {"id": USER, "email": "a@b.co"}}),
@@ -305,6 +324,7 @@ mod tests {
                 (Method::Get, "/rest/v1/sections") => {
                     let select = r.query.iter().find(|(k, _)| k == "select").map(|(_, v)| v.as_str()).unwrap_or("");
                     let wanted = r.query.iter().find(|(k, _)| k == "name").map(|(_, v)| v.trim_start_matches("eq.").to_string());
+                    let server_who = server.who.clone();
                     let rows: Vec<Value> = server
                         .sections
                         .iter()
@@ -313,7 +333,7 @@ mod tests {
                             if select.contains("content") {
                                 json!({"content": c, "version": v})
                             } else {
-                                json!({"name": n, "version": v})
+                                json!({"name": n, "version": v, "updated_who": server_who.get(n).cloned().unwrap_or_default()})
                             }
                         })
                         .collect();
@@ -330,6 +350,7 @@ mod tests {
                     if current != base {
                         return reply(400, json!({"code": "40001", "message": "conflicto"}));
                     }
+                    server.who.insert(name.clone(), body["p_who"].as_str().unwrap_or("").to_string());
                     server.sections.insert(name, (content, current + 1));
                     reply(200, json!(current + 1))
                 }
@@ -358,6 +379,7 @@ mod tests {
             group: GROUP.into(),
             project: PROJECT.into(),
             versions: BTreeMap::new(),
+            authors: BTreeMap::new(),
         }
     }
 
@@ -377,16 +399,48 @@ mod tests {
         let (ana_dir, luis_dir) = (folder_for("ana"), folder_for("luis"));
         let (mut ana_link, mut luis_link) = (link(), link());
         put(&ana_dir, "guion", r#"{"paragraphs": []}"#);
-        let r = sync_once(&mut ana, &ana_dir, &mut ana_link).unwrap();
+        let r = sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
         assert_eq!(r.pushed, vec!["guion".to_string()]);
-        let r = sync_once(&mut luis, &luis_dir, &mut luis_link).unwrap();
+        let r = sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
         assert_eq!(r.pulled, vec!["guion".to_string()]);
         assert_eq!(get(&luis_dir, "guion"), r#"{"paragraphs": []}"#);
         // Sin cambios, no pasa nada de nuevo.
-        let r = sync_once(&mut luis, &luis_dir, &mut luis_link).unwrap();
+        let r = sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
         assert_eq!(r, Report::default());
         // El enlace se recuerda entre sesiones.
         assert_eq!(CloudLink::load(&luis_dir), Some(luis_link));
+    }
+
+    #[test]
+    fn the_name_of_whoever_pushed_a_section_travels_with_it() {
+        let server = Arc::new(Mutex::new(Server::default()));
+        let (mut ana, mut luis) = (person(&server), person(&server));
+        let (ana_dir, luis_dir) = (folder_for("ana5"), folder_for("luis5"));
+        let (mut ana_link, mut luis_link) = (link(), link());
+        put(&ana_dir, "guion", r#"{"a":1}"#);
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
+        sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
+        assert_eq!(luis_link.authors.get("guion").map(String::as_str), Some("Ana"));
+    }
+
+    #[test]
+    fn a_round_with_nothing_new_only_asks_for_the_project_number() {
+        let server = Arc::new(Mutex::new(Server::default()));
+        let (mut ana, mut luis) = (person(&server), person(&server));
+        let (ana_dir, luis_dir) = (folder_for("ana6"), folder_for("luis6"));
+        let (mut ana_link, mut luis_link) = (link(), link());
+        put(&ana_dir, "guion", r#"{"a":1}"#);
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
+        sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
+        server.lock().unwrap().calls.clear();
+        let r = sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
+        assert_eq!(r, Report::default());
+        assert_eq!(server.lock().unwrap().calls, vec!["/rest/v1/rpc/project_stamp".to_string()]);
+        // Si Ana sube algo, el número cambia y Luis lo trae.
+        put(&ana_dir, "guion", r#"{"a":2}"#);
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
+        let r = sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
+        assert_eq!(r.pulled, vec!["guion".to_string()]);
     }
 
     #[test]
@@ -397,21 +451,21 @@ mod tests {
         let (mut ana_link, mut luis_link) = (link(), link());
         let base = r#"{"paragraphs":[{"id":1,"text":"uno"},{"id":2,"text":"dos"}]}"#;
         put(&ana_dir, "guion", base);
-        sync_once(&mut ana, &ana_dir, &mut ana_link).unwrap();
-        sync_once(&mut luis, &luis_dir, &mut luis_link).unwrap();
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
+        sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
         // Los dos editan párrafos distintos y guardan en su carpeta.
         put(&ana_dir, "guion", r#"{"paragraphs":[{"id":1,"text":"UNO"},{"id":2,"text":"dos"}]}"#);
         put(&luis_dir, "guion", r#"{"paragraphs":[{"id":1,"text":"uno"},{"id":2,"text":"DOS"}]}"#);
-        sync_once(&mut ana, &ana_dir, &mut ana_link).unwrap();
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
         // Luis se adelantó?: no, Ana subió primero. Al subir, a Luis la nube le trae lo de Ana, lo combina y lo sube.
-        let r = sync_once(&mut luis, &luis_dir, &mut luis_link).unwrap();
+        let r = sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
         assert_eq!(r.merged, vec!["guion".to_string()]);
         assert_eq!(r.pushed, vec!["guion".to_string()]);
         let merged: Value = serde_json::from_str(&get(&luis_dir, "guion")).unwrap();
         assert_eq!(merged["paragraphs"][0]["text"], "UNO");
         assert_eq!(merged["paragraphs"][1]["text"], "DOS");
         // Ana lo recibe.
-        sync_once(&mut ana, &ana_dir, &mut ana_link).unwrap();
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
         assert_eq!(serde_json::from_str::<Value>(&get(&ana_dir, "guion")).unwrap(), merged);
     }
 
@@ -422,14 +476,14 @@ mod tests {
         let (ana_dir, luis_dir) = (folder_for("ana3"), folder_for("luis3"));
         let (mut ana_link, mut luis_link) = (link(), link());
         put(&ana_dir, "guion", r#"{"a":1}"#);
-        sync_once(&mut ana, &ana_dir, &mut ana_link).unwrap();
-        sync_once(&mut luis, &luis_dir, &mut luis_link).unwrap();
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
+        sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
         // Ana sube una versión nueva entre el pull y el push de Luis.
         put(&luis_dir, "guion", r#"{"a":2}"#);
         put(&ana_dir, "guion", r#"{"a":3}"#);
-        sync_once(&mut ana, &ana_dir, &mut ana_link).unwrap();
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
         let mut report = Report::default();
-        push(&mut luis, &luis_dir, &mut luis_link, &mut report).unwrap();
+        push(&mut luis, &luis_dir, &mut luis_link, &mut report, "Luis").unwrap();
         assert!(report.retry && report.pushed.is_empty());
         assert_eq!(get(&luis_dir, "guion"), r#"{"a":2}"#, "lo local sigue intacto");
     }
@@ -441,12 +495,12 @@ mod tests {
         let (ana_dir, luis_dir) = (folder_for("ana4"), folder_for("luis4"));
         let (mut ana_link, mut luis_link) = (link(), link());
         put(&ana_dir, "guion", r#"{"paragraphs":[{"id":1,"text":"uno"}]}"#);
-        sync_once(&mut ana, &ana_dir, &mut ana_link).unwrap();
-        sync_once(&mut luis, &luis_dir, &mut luis_link).unwrap();
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
+        sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
         put(&ana_dir, "guion", r#"{"paragraphs":[{"id":1,"text":"de Ana"}]}"#);
         put(&luis_dir, "guion", r#"{"paragraphs":[{"id":1,"text":"de Luis"}]}"#);
-        sync_once(&mut ana, &ana_dir, &mut ana_link).unwrap();
-        let r = sync_once(&mut luis, &luis_dir, &mut luis_link).unwrap();
+        sync_once(&mut ana, &ana_dir, &mut ana_link, "Ana").unwrap();
+        let r = sync_once(&mut luis, &luis_dir, &mut luis_link, "Luis").unwrap();
         assert_eq!(r.conflicts, vec!["guion".to_string()]);
         assert!(get(&luis_dir, "guion").contains("de Ana"));
         let backups: Vec<_> = fs::read_dir(conflict_dir(&luis_dir)).unwrap().flatten().collect();
@@ -482,7 +536,7 @@ mod tests {
         let heading = project.make_paragraph(ParagraphKind::SceneHeading, "INT. CASA - DÍA");
         project.paragraphs = vec![heading];
         folder::save(&project, &src).unwrap();
-        let shared = share_project(&mut ana, GROUP, "Corto", &src).unwrap();
+        let shared = share_project(&mut ana, GROUP, "Corto", &src, "Ana").unwrap();
         assert_eq!(shared.project, PROJECT);
         assert!(server.lock().unwrap().sections.contains_key("guion"));
         let dst = folder_for("share-dst");

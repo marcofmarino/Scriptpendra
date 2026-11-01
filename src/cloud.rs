@@ -102,6 +102,7 @@ fn map_error(status: u16, body: &[u8]) -> CloudError {
         "53400" => return CloudError::TooMany,
         "42501" => return CloudError::Forbidden,
         "28000" => return CloudError::NotSignedIn,
+        "23505" => return CloudError::Invalid("Ese nombre ya lo usa otra persona.".into()),
         "22023" => return CloudError::Invalid("Los datos no son válidos.".into()),
         _ => {}
     }
@@ -217,6 +218,19 @@ pub fn check_public_key(key: &str) -> Result<bool, String> {
         Some("service_role") => Err(secret.into()),
         _ => Err("Esa clave no es la clave pública (anon).".into()),
     }
+}
+
+/// ¿Es un nombre de usuario válido? De 3 a 30 letras, números, espacios, puntos, guiones o guiones bajos; empieza y termina con una
+/// letra o un número y no tiene dos espacios seguidos. Es la misma regla que aplica el servidor.
+pub fn valid_display_name(name: &str) -> bool {
+    let n = name.trim();
+    let count = n.chars().count();
+    let alnum = |c: char| c.is_alphanumeric() && (c.is_ascii() || "ÁÉÍÓÚÜÑáéíóúüñ".contains(c));
+    (3..=30).contains(&count)
+        && n.chars().next().is_some_and(alnum)
+        && n.chars().last().is_some_and(alnum)
+        && n.chars().all(|c| alnum(c) || matches!(c, ' ' | '.' | '_' | '-'))
+        && !n.contains("  ")
 }
 
 /// Un mail razonable: lo justo para no mandar basura al servidor (el servidor lo valida de verdad).
@@ -448,6 +462,10 @@ impl<T: Transport> Client<T> {
         &self.url
     }
 
+    pub fn user_id(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.user_id.as_str())
+    }
+
     pub fn email(&self) -> Option<&str> {
         self.session.as_ref().map(|s| s.email.as_str())
     }
@@ -571,6 +589,27 @@ impl<T: Transport> Client<T> {
         self.session = None;
     }
 
+    // --- Nombre ------------------------------------------------------------------------------------------------
+
+    /// El nombre que eligió la persona (`None` si todavía no eligió).
+    pub fn display_name(&mut self) -> Result<Option<String>, CloudError> {
+        let id = self.user_id().map(str::to_string).ok_or(CloudError::NotSignedIn)?;
+        Self::uuid_arg(&id)?;
+        let v = self.select("profiles", vec![("select", "display_name".into()), ("id", format!("eq.{id}"))], MAX_JSON_BYTES)?;
+        let name = v.as_array().and_then(|a| a.first()).and_then(|r| r.get("display_name")).and_then(Value::as_str);
+        Ok(name.map(|n| n.chars().filter(|c| !c.is_control()).take(60).collect::<String>()).filter(|n| !n.is_empty()))
+    }
+
+    /// Elige el nombre. Se puede una sola vez y no se cambia después: lo hace cumplir el servidor.
+    pub fn set_display_name(&mut self, name: &str) -> Result<String, CloudError> {
+        let name = name.trim();
+        if !valid_display_name(name) {
+            return Err(CloudError::Invalid("El nombre tiene que tener de 3 a 30 letras, números, espacios, puntos o guiones.".into()));
+        }
+        let v = self.rpc("set_display_name", json!({"new_name": name}))?;
+        v.as_str().map(str::to_string).ok_or(CloudError::Protocol)
+    }
+
     // --- Datos -------------------------------------------------------------------------------------------------
 
     fn rpc(&mut self, name: &str, args: Value) -> Result<Value, CloudError> {
@@ -656,12 +695,18 @@ impl<T: Transport> Client<T> {
             .collect())
     }
 
-    /// Las secciones de un proyecto con su versión: (nombre, versión).
-    pub fn section_versions(&mut self, project: &str) -> Result<Vec<(String, i64)>, CloudError> {
+    /// Un número que cambia cada vez que alguien sube algo al proyecto: es la suma de las versiones de sus secciones.
+    pub fn project_stamp(&mut self, project: &str) -> Result<i64, CloudError> {
+        Self::uuid_arg(project)?;
+        self.rpc("project_stamp", json!({"pid": project}))?.as_i64().ok_or(CloudError::Protocol)
+    }
+
+    /// Las secciones de un proyecto con su versión y quién la subió: (nombre, versión, quién).
+    pub fn section_versions(&mut self, project: &str) -> Result<Vec<(String, i64, String)>, CloudError> {
         Self::uuid_arg(project)?;
         let v = self.select(
             "sections",
-            vec![("select", "name,version".into()), ("project_id", format!("eq.{project}"))],
+            vec![("select", "name,version,updated_who".into()), ("project_id", format!("eq.{project}"))],
             MAX_JSON_BYTES,
         )?;
         let rows = v.as_array().ok_or(CloudError::Protocol)?;
@@ -669,7 +714,9 @@ impl<T: Transport> Client<T> {
             .iter()
             .filter_map(|r| {
                 let name = r.get("name")?.as_str().filter(|n| is_section_name(n))?.to_string();
-                Some((name, r.get("version")?.as_i64()?))
+                // El nombre lo escribió otra persona: se limpia y se acota antes de mostrarlo.
+                let who: String = r.get("updated_who").and_then(Value::as_str).unwrap_or("").chars().filter(|c| !c.is_control()).take(60).collect();
+                Some((name, r.get("version")?.as_i64()?, who))
             })
             .collect())
     }
@@ -698,7 +745,7 @@ impl<T: Transport> Client<T> {
     }
 
     /// Sube una sección si nadie escribió desde `base_version` (0 si es nueva). Devuelve la versión nueva.
-    pub fn push_section(&mut self, project: &str, name: &str, base_version: i64, content: &[u8]) -> Result<i64, CloudError> {
+    pub fn push_section(&mut self, project: &str, name: &str, base_version: i64, content: &[u8], who: &str) -> Result<i64, CloudError> {
         Self::uuid_arg(project)?;
         if !is_section_name(name) {
             return Err(CloudError::Invalid("Sección inválida.".into()));
@@ -709,7 +756,13 @@ impl<T: Transport> Client<T> {
         let text = std::str::from_utf8(content).map_err(|_| CloudError::Invalid("La sección no es texto.".into()))?;
         let v = self.rpc(
             "push_section",
-            json!({"pid": project, "section": name, "base_version": base_version, "new_content": text}),
+            json!({
+                "pid": project,
+                "section": name,
+                "base_version": base_version,
+                "new_content": text,
+                "p_who": who.chars().filter(|c| !c.is_control()).take(60).collect::<String>(),
+            }),
         )?;
         v.as_i64().ok_or(CloudError::Protocol)
     }
@@ -1072,6 +1125,30 @@ mod tests {
     }
 
     #[test]
+    fn the_name_is_checked_with_the_same_rule_as_the_server_and_a_duplicate_is_explained() {
+        for ok in ["Ana", "Luis M", "ana_lopez-2", "Ñandú", "José Pérez"] {
+            assert!(valid_display_name(ok), "{ok}");
+        }
+        for bad in ["ab", "", "  ", "-ana", "ana-", "a  b", "a<b>c", "Ana\nLópez", &"x".repeat(31), "😀😀😀"] {
+            assert!(!valid_display_name(bad), "{bad:?}");
+        }
+        let fake = Fake::default();
+        let mut c = client(&fake);
+        login(&fake, &mut c);
+        assert!(matches!(c.set_display_name("ab"), Err(CloudError::Invalid(_))));
+        assert!(fake.seen.lock().unwrap().is_empty(), "un nombre inválido ni sale");
+        fake.reply(400, r#"{"code":"23505","message":"duplicate key"}"#);
+        assert!(matches!(c.set_display_name("Ana"), Err(CloudError::Invalid(m)) if m.contains("otra persona")));
+        fake.reply(200, r#""Ana""#);
+        assert_eq!(c.set_display_name("  Ana "), Ok("Ana".to_string()));
+        fake.reply(200, r#"[{"display_name":""}]"#);
+        assert_eq!(c.display_name(), Ok(None));
+        fake.reply(200, r#"[{"display_name":"Ana"}]"#);
+        assert_eq!(c.display_name(), Ok(Some("Ana".to_string())));
+        c.sign_out_without_keyring();
+    }
+
+    #[test]
     fn requests_carry_the_public_key_and_after_login_the_user_token() {
         let fake = Fake::default();
         let mut c = client(&fake);
@@ -1118,7 +1195,7 @@ mod tests {
         login(&fake, &mut c);
         assert!(matches!(c.projects("../../auth/v1/admin"), Err(CloudError::Invalid(_))));
         assert!(matches!(c.section(UUID_A, "../x"), Err(CloudError::Invalid(_))));
-        assert!(matches!(c.push_section("x", "guion", 0, b"{}"), Err(CloudError::Invalid(_))));
+        assert!(matches!(c.push_section("x", "guion", 0, b"{}", ""), Err(CloudError::Invalid(_))));
         assert!(matches!(c.create_invite("not-a-uuid"), Err(CloudError::Invalid(_))));
         assert!(matches!(c.join_group("../../etc/passwd"), Err(CloudError::Invalid(_))));
         assert!(matches!(c.delete_image(UUID_A, UUID_B, "..", "png"), Err(CloudError::Invalid(_))));
@@ -1138,14 +1215,14 @@ mod tests {
         let mut c = client(&fake);
         login(&fake, &mut c);
         fake.reply(200, "2");
-        assert_eq!(c.push_section(UUID_B, "guion", 1, br#"{"a":1}"#).unwrap(), 2);
+        assert_eq!(c.push_section(UUID_B, "guion", 1, br#"{"a":1}"#, "Ana").unwrap(), 2);
         let body: Value = serde_json::from_slice(&fake.seen.lock().unwrap()[0].body).unwrap();
         assert_eq!(body["base_version"], 1);
         assert_eq!(body["section"], "guion");
         fake.reply(400, r#"{"code":"40001","message":"conflicto"}"#);
-        assert_eq!(c.push_section(UUID_B, "guion", 1, b"{}"), Err(CloudError::Conflict));
+        assert_eq!(c.push_section(UUID_B, "guion", 1, b"{}", "Ana"), Err(CloudError::Conflict));
         let too_big = vec![b'x'; MAX_SECTION_BYTES + 1];
-        assert_eq!(c.push_section(UUID_B, "guion", 1, &too_big), Err(CloudError::TooLarge));
+        assert_eq!(c.push_section(UUID_B, "guion", 1, &too_big, "Ana"), Err(CloudError::TooLarge));
         c.sign_out_without_keyring();
     }
 
@@ -1229,5 +1306,15 @@ mod tests {
         fn sign_out_without_keyring(&mut self) {
             self.session = None;
         }
+    }
+
+    /// Prueba manual con el llavero real de la computadora (`cargo test -- --ignored keyring`): guarda, lee y borra una entrada.
+    #[test]
+    #[ignore]
+    fn keyring_roundtrip_with_the_real_system_keyring() {
+        let entry = keyring::Entry::new("scriptpendra-prueba", "https://prueba.invalid").expect("entrada");
+        entry.set_password("secreto de prueba").expect("guardar en el llavero");
+        assert_eq!(entry.get_password().expect("leer del llavero"), "secreto de prueba");
+        entry.delete_credential().expect("borrar del llavero");
     }
 }

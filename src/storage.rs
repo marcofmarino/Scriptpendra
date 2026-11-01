@@ -183,6 +183,11 @@ pub struct Settings {
     /// Versión de los ajustes; los anteriores a la 2 guardaban en «script_pt» el tamaño de la vista.
     pub settings_version: u32,
     pub autosave: bool,
+    /// Mostrar los avisos de lo que cambian otras personas (la campanita de la barra de estado).
+    pub notifications: bool,
+    /// El nombre ya lo fijó la cuenta de la nube y no se puede cambiar (no se guarda: lo dice el servidor).
+    #[serde(skip)]
+    pub name_locked: bool,
     /// El nombre con que se firman las versiones guardadas del historial.
     pub user_name: String,
     /// Qué tramo de ids usa esta copia del programa (se sortea una vez): ver `Project::use_id_block`.
@@ -217,6 +222,8 @@ impl Default for Settings {
             paper: Paper::A4,
             settings_version: 4,
             autosave: true,
+            notifications: true,
+            name_locked: false,
             user_name: String::new(),
             user_id: 0,
             cloud_url: String::new(),
@@ -287,6 +294,12 @@ pub fn new_agenda_id() -> u64 {
 }
 
 impl Settings {
+    /// Con qué nombre se firma lo que hace esta persona: el que puso o, si no puso ninguno, el del usuario del sistema.
+    pub fn author(&self) -> String {
+        let name = self.user_name.trim();
+        if name.is_empty() { os_user_name() } else { name.chars().filter(|c| !c.is_control()).take(60).collect() }
+    }
+
     pub fn load() -> Self {
         let mut settings = Self::from_text(
             config_path()

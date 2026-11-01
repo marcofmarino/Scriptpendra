@@ -1,3 +1,6 @@
+// En Windows, la versión final no abre una ventana de consola detrás del programa.
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
 mod app;
 mod assets;
 mod blocking;
@@ -47,6 +50,10 @@ mod widgets;
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_app_id("io.github.marcofmarino.Scriptpendra")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icono.png")).expect("el icono del programa es un PNG válido"),
+            )
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size(ui::tokens::WINDOW_MIN),
         ..Default::default()

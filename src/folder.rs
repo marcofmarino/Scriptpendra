@@ -20,7 +20,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::model::Project;
 
@@ -328,6 +328,98 @@ pub fn merge_section(base: &[u8], mine: &[u8], theirs: &[u8]) -> Result<Vec<u8>,
         (true, Some(v)) => Ok(pretty(&v)),
         _ => Err(conflicts),
     }
+}
+
+/// Cómo se llama, en singular y plural, lo que guarda cada campo de una sección (para decir «agregó un plano»).
+fn thing_name(key: &str) -> (&'static str, &'static str) {
+    match key {
+        "paragraphs" => ("párrafo", "párrafos"),
+        "comments" => ("comentario", "comentarios"),
+        "shots" => ("plano", "planos"),
+        "blockings" => ("planta", "plantas"),
+        "characters" => ("personaje", "personajes"),
+        "location_profiles" => ("locación", "locaciones"),
+        "objects" => ("objeto", "objetos"),
+        "elements" => ("elemento", "elementos"),
+        "documents" => ("documento", "documentos"),
+        "outline" => ("escena del tratamiento", "escenas del tratamiento"),
+        "drama" => ("punto de la curva", "puntos de la curva"),
+        "sound_cues" => ("sonido", "sonidos"),
+        "sound_gear" => ("equipo de sonido", "equipos de sonido"),
+        "photo_gear" => ("equipo de fotografía", "equipos de fotografía"),
+        "art_items" => ("elemento de arte", "elementos de arte"),
+        "breakdown_items" => ("elemento del desglose", "elementos del desglose"),
+        "breakdown_categories" => ("categoría", "categorías"),
+        "shoot_days" => ("día de rodaje", "días de rodaje"),
+        "shoot_locations" => ("lugar de rodaje", "lugares de rodaje"),
+        "contacts" => ("contacto", "contactos"),
+        _ => ("elemento", "elementos"),
+    }
+}
+
+/// El texto con que se reconoce una cosa de una lista: su texto, título o nombre.
+fn display_text(item: &Value) -> String {
+    let obj = item.as_object();
+    let text = ["text", "title", "name", "label", "heading", "description"]
+        .iter()
+        .filter_map(|k| obj?.get(*k)?.as_str())
+        .map(str::trim)
+        .find(|t| !t.is_empty())
+        .unwrap_or("(sin texto)");
+    let one_line: String = text.lines().next().unwrap_or("").chars().take(70).collect();
+    if text.chars().count() > 70 { format!("{one_line}…") } else { one_line }
+}
+
+/// Qué cambió entre dos versiones de una sección, en frases cortas para mostrarle a la persona: «Agregó un párrafo: “Ana abre la
+/// puerta.”», «Editó un plano: …», «Borró 2 párrafos». Como máximo `limit` frases. Lo que no se puede describir por cosa (un
+/// valor suelto) sale como «Cambió …».
+pub fn describe_change(before: &[u8], after: &[u8], limit: usize) -> Vec<String> {
+    let parse = |b: &[u8]| serde_json::from_slice::<Value>(b).ok().and_then(|v| if let Value::Object(m) = v { Some(m) } else { None });
+    let (Some(old), Some(new)) = (parse(before), parse(after)) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let keys: std::collections::BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+    for key in keys {
+        if key == "next_id" || old.get(key) == new.get(key) {
+            continue;
+        }
+        let (one, many) = thing_name(key);
+        match (old.get(key), new.get(key)) {
+            (Some(Value::Array(a)), Some(Value::Array(b))) if is_id_list(b) || is_id_list(a) => {
+                fn find(list: &[Value], id: u64) -> Option<&Value> {
+                    list.iter().find(|v| id_of(v) == Some(id))
+                }
+                let added: Vec<&Value> = b.iter().filter(|v| id_of(v).is_some_and(|i| find(a, i).is_none())).collect();
+                let changed: Vec<&Value> = b
+                    .iter()
+                    .filter(|v| id_of(v).is_some_and(|i| find(a, i).is_some_and(|o| o != *v)))
+                    .collect();
+                let removed = a.iter().filter(|v| id_of(v).is_some_and(|i| find(b, i).is_none())).count();
+                for v in added.iter().take(3) {
+                    lines.push(format!("Agregó {} «{}»", one, display_text(v)));
+                }
+                if added.len() > 3 {
+                    lines.push(format!("…y {} {many} más", added.len() - 3));
+                }
+                for v in changed.iter().take(3) {
+                    lines.push(format!("Editó {} «{}»", one, display_text(v)));
+                }
+                if changed.len() > 3 {
+                    lines.push(format!("…y editó {} {many} más", changed.len() - 3));
+                }
+                if removed > 0 {
+                    lines.push(if removed == 1 { format!("Borró un {one}") } else { format!("Borró {removed} {many}") });
+                }
+            }
+            (_, Some(Value::String(text))) => {
+                lines.push(format!("Cambió el texto: «{}»", display_text(&json!({"text": text}))));
+            }
+            _ => lines.push(format!("Cambió {}", key.replace('_', " "))),
+        }
+    }
+    lines.truncate(limit);
+    lines
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -756,5 +848,23 @@ mod tests {
             &section_of_project(&theirs, "guion"),
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_change_is_described_with_the_content_that_changed() {
+        let mut base = sample();
+        let rain = base.make_paragraph(ParagraphKind::Action, "Llueve.");
+        base.paragraphs.push(rain);
+        let mut after = base.clone();
+        after.paragraphs[1].text = "Ana cierra la puerta.".into();
+        let new = after.make_paragraph(ParagraphKind::Action, "Entra Luis.");
+        after.paragraphs.push(new);
+        after.paragraphs.remove(2);
+        let lines = describe_change(&section_of_project(&base, "guion"), &section_of_project(&after, "guion"), 6);
+        assert!(lines.contains(&"Agregó párrafo «Entra Luis.»".to_string()), "{lines:?}");
+        assert!(lines.contains(&"Editó párrafo «Ana cierra la puerta.»".to_string()), "{lines:?}");
+        assert!(lines.contains(&"Borró un párrafo".to_string()), "{lines:?}");
+        assert!(describe_change(&section_of_project(&base, "guion"), &section_of_project(&base, "guion"), 6).is_empty());
+        assert_eq!(describe_change(b"no json", b"{}", 6), Vec::<String>::new());
     }
 }

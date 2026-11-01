@@ -65,11 +65,26 @@ declare
   b uuid := '00000000-0000-0000-0000-0000000000b2';
   ga uuid; gb uuid; pa uuid; pb uuid; code text; v bigint; n bigint; r text;
 begin
+  -- Los nombres: se eligen una vez, son únicos y los pone el servidor.
+  perform pg_temp.as_user(a);
+  perform pg_temp.must_fail('un nombre muy corto', 'select public.set_display_name(''ab'')', 'inválido');
+  perform pg_temp.must_fail('un nombre con símbolos raros', 'select public.set_display_name(''a<b>c'')', 'inválido');
+  perform pg_temp.must_fail('un nombre reservado', 'select public.set_display_name(''Admin'')', 'reservado');
+  perform pg_temp.must_equal('se puede elegir el nombre', public.set_display_name('  Ana  '), 'Ana');
+  perform pg_temp.must_fail('el nombre no se puede cambiar después', 'select public.set_display_name(''Otra'')', 'ya está elegido');
+  perform pg_temp.must_fail('tampoco con un UPDATE directo', format('update public.profiles set display_name = ''Falsa'' where id = %L', a));
+  perform pg_temp.as_user(b);
+  perform pg_temp.must_fail('otra persona no puede usar el mismo nombre (sin importar mayúsculas)',
+    'select public.set_display_name(''ANA'')', 'duplicate');
+  perform pg_temp.must_equal('B elige su nombre', public.set_display_name('Luis'), 'Luis');
+
   -- Cada uno crea su grupo y su proyecto.
   perform pg_temp.as_user(a);
   ga := public.create_group('Grupo A');
   pa := public.create_project(ga, 'Corto A');
-  v := public.push_section(pa, 'guion', 0, '{"x":1}');
+  v := public.push_section(pa, 'guion', 0, '{"x":1}', 'Falso');
+  perform pg_temp.must_equal('la sección lleva el nombre del servidor, no el que diga el programa',
+    (select updated_who from public.sections where project_id = pa and name = 'guion'), 'Ana');
   perform pg_temp.must_equal('push de una sección nueva da la versión 1', v, 1::bigint);
 
   perform pg_temp.as_user(b);
@@ -87,6 +102,8 @@ begin
     format('select public.create_project(%L, ''X'')', ga), 'no permitido');
   perform pg_temp.must_fail('B no puede crear un código para el grupo de A',
     format('select public.create_invite(%L)', ga), 'no permitido');
+  perform pg_temp.must_fail('B no puede preguntar por los cambios de un proyecto de A',
+    format('select public.project_stamp(%L)', pa), 'no permitido');
   perform pg_temp.must_fail('B no puede reservar imágenes en un proyecto de A',
     format('select public.reserve_image(%L, repeat(''a'', 64), ''png'', 1000)', pa), 'no permitido');
   perform pg_temp.must_fail('B no puede escribir directo en la tabla de secciones',
@@ -107,7 +124,7 @@ begin
 
   -- Presencia: quien no es del grupo no la ve ni la toca.
   perform pg_temp.as_user(a);
-  perform public.set_presence(pa, 'Ana', 'Guion', 'escena 3');
+  perform public.set_presence(pa, 'Falso', 'Guion', 'escena 3');
   perform pg_temp.as_user(b);
   perform pg_temp.must_fail('B no puede avisar presencia en un proyecto de A',
     format('select public.set_presence(%L, ''B'', ''Guion'', '''')', pa), 'no permitido');
@@ -127,10 +144,18 @@ begin
 
   perform pg_temp.must_equal('después de entrar, B ve que A está en la escena 3',
     (select detail from public.project_presence(pa) limit 1), 'escena 3');
+  perform pg_temp.must_equal('la presencia lleva el nombre del servidor',
+    (select who from public.project_presence(pa) limit 1), 'Ana');
+
+  perform pg_temp.must_equal('el número del proyecto sube al subir una sección', public.project_stamp(pa), 1::bigint);
+  perform pg_temp.as_user(a);
+  perform pg_temp.as_user(b);
 
   -- Escrituras con versión: se detecta que alguien se adelantó.
-  v := public.push_section(pa, 'guion', 1, '{"x":2}');
+  v := public.push_section(pa, 'guion', 1, '{"x":2}', 'Luis');
   perform pg_temp.must_equal('push con la versión correcta sube la versión', v, 2::bigint);
+  perform pg_temp.must_equal('la sección guarda quién la subió',
+    (select updated_who from public.sections where project_id = pa and name = 'guion'), 'Luis');
   perform pg_temp.as_user(a);
   perform pg_temp.must_fail('push con una versión vieja es un conflicto',
     format('select public.push_section(%L, ''guion'', 1, ''{"x":3}'')', pa), 'conflicto');

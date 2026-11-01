@@ -2855,9 +2855,20 @@ pub fn settings(
                     kit::section(ui, p, "Guardado", None);
                     changed |= ui.checkbox(&mut settings.autosave, "Guardar los cambios automáticamente").changed();
                     kit::section(ui, p, "Tu nombre", None);
-                    ui.add(egui::Label::new("Para saber quién hizo cada versión").wrap());
+                    let locked = settings.name_locked;
+                    ui.add(
+                        egui::Label::new(if locked {
+                            "Es el nombre de tu cuenta: no se puede cambiar."
+                        } else {
+                            "Para saber quién hizo cada versión"
+                        })
+                        .wrap(),
+                    );
                     changed |= ui
-                        .add(egui::TextEdit::singleline(&mut settings.user_name).desired_width(240.0).hint_text("Ana"))
+                        .add_enabled(
+                            !locked,
+                            egui::TextEdit::singleline(&mut settings.user_name).desired_width(240.0).hint_text("Ana"),
+                        )
                         .changed();
                     kit::section(ui, p, "Atajos del editor", None);
                     for (k, d) in [
@@ -2952,6 +2963,8 @@ pub enum HomeAction {
     Open,
     OpenRecent(std::path::PathBuf),
     Settings,
+    /// La cuenta y la nube (iniciar sesión, grupos, proyectos compartidos).
+    Cloud,
 }
 
 pub fn ago(modified: Option<std::time::SystemTime>) -> String {
@@ -3124,7 +3137,8 @@ fn action_card(ui: &mut Ui, p: &Palette, code: &str, label: &str) -> egui::Respo
 }
 
 /// Pantalla de inicio: una grilla con «Crear historia», «Abrir historia» y las historias recientes.
-pub fn home(ui: &mut Ui, cards: &[RecentCard], p: &Palette) -> Option<HomeAction> {
+/// La pantalla de inicio. `account` es lo que dice el botón de la cuenta: «Iniciar sesión» o el nombre de quien entró.
+pub fn home(ui: &mut Ui, cards: &[RecentCard], p: &Palette, account: &str) -> Option<HomeAction> {
     let mut action = None;
     // Arriba, el nombre de la app y el engranaje de Ajustes contra el borde derecho.
     crate::ui::kit::sides(
@@ -3139,6 +3153,13 @@ pub fn home(ui: &mut Ui, cards: &[RecentCard], p: &Palette) -> Option<HomeAction
         |ui| {
             if crate::ui::kit::icon_button(ui, p, icon::GEAR, "Ajustes", true).clicked() {
                 action = Some(HomeAction::Settings);
+            }
+            if ui
+                .button(format!("{}  {account}", icon::CLOUD))
+                .on_hover_text("Tu cuenta, tus grupos y los proyectos compartidos")
+                .clicked()
+            {
+                action = Some(HomeAction::Cloud);
             }
         },
     );

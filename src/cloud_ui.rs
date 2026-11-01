@@ -15,12 +15,14 @@ use crate::{
     cloudimages,
     cloudsync::{self, CloudLink, Report},
     storage::Settings,
-    theme::Palette,
+    theme::{self, Palette},
     ui::{kit, tokens},
 };
 
-/// Cada cuántos segundos se sincroniza un proyecto unido a la nube.
-const SYNC_SECS: f64 = 6.0;
+/// Cada cuántos segundos se sincroniza un proyecto unido a la nube: rápido cuando hay otra persona trabajando o se está editando, y
+/// despacio si no, para no gastar tráfico de más.
+const SYNC_FAST_SECS: f64 = 2.0;
+const SYNC_SLOW_SECS: f64 = 15.0;
 
 /// Cada cuántos segundos se avisa dónde estoy (el servidor da por ido a quien lleva más de 30 sin avisar).
 const PRESENCE_SECS: f64 = 8.0;
@@ -34,12 +36,14 @@ enum Job {
     Invite(String),
     Join(String),
     Projects(String),
-    Share { group: String, name: String, file: PathBuf },
+    Share { group: String, name: String, file: PathBuf, who: String },
     Open { group: String, project: String, file: PathBuf },
-    Sync { file: PathBuf, link: CloudLink },
+    Sync { file: PathBuf, link: CloudLink, who: String },
     Usage(String),
     Images(ImageWork),
     Presence { project: String, who: String, screen: String, detail: String },
+    Profile,
+    SetName(String),
 }
 
 /// Lo que hay que hacer con las imágenes de un proyecto.
@@ -79,6 +83,8 @@ enum Event {
     Usage(i64, i64, i64),
     Images(ImageResult),
     Peers(Vec<cloud::Peer>),
+    /// El nombre que tiene la persona en el servidor (`None`: todavía no eligió).
+    Name(Option<String>),
     Error(String),
 }
 
@@ -134,17 +140,19 @@ fn run(client: &mut Client<HttpsTransport>, job: Job) -> Event {
             Err(e) => fail(e),
         },
         Job::Projects(group) => client.projects(&group).map(Event::Projects).unwrap_or_else(fail),
-        Job::Share { group, name, file } => cloudsync::share_project(client, &group, &name, &file)
+        Job::Share { group, name, file, who } => cloudsync::share_project(client, &group, &name, &file, &who)
             .map(Event::Shared)
             .unwrap_or_else(fail_sync),
         Job::Open { group, project, file } => cloudsync::download_project(client, &group, &project, &file)
             .map(|link| Event::Opened(file.clone(), link))
             .unwrap_or_else(fail_sync),
-        Job::Sync { file, mut link } => match cloudsync::sync_once(client, &file, &mut link) {
+        Job::Sync { file, mut link, who } => match cloudsync::sync_once(client, &file, &mut link, &who) {
             Ok(report) => Event::Synced(report, link),
             Err(e) => fail_sync(e),
         },
         Job::Images(work) => Event::Images(cloudimages::run(client, work)),
+        Job::Profile => client.display_name().map(Event::Name).unwrap_or_else(fail),
+        Job::SetName(name) => client.set_display_name(&name).map(|n| Event::Name(Some(n))).unwrap_or_else(fail),
         Job::Presence { project, who, screen, detail } => {
             // Avisar que estoy y ver quién más está: si falla no es importante, no se muestra como error.
             let _ = client.set_presence(&project, &who, &screen, &detail);
@@ -170,6 +178,8 @@ pub struct Out {
     pub disk_changed: bool,
     /// Hay algo para avisar en la barra de estado.
     pub message: Option<String>,
+    /// El nombre de la persona según el servidor (cuando llegó o cambió).
+    pub name: Option<String>,
     /// Quién más está en el proyecto (cuando llegó una actualización).
     pub peers: Option<Vec<cloud::Peer>>,
     /// Cambió la configuración (URL o clave).
@@ -207,6 +217,13 @@ pub struct CloudUi {
     presence_busy: bool,
     last_presence: f64,
     last_sync: f64,
+    /// Entrar o crear cuenta (0 / 1) y si se ve la contraseña.
+    login_mode: usize,
+    show_password: bool,
+    /// El nombre que tiene la persona en el servidor, y lo que está escribiendo para elegirlo.
+    cloud_name: Option<String>,
+    name_loaded: bool,
+    name_input: String,
     config_url: String,
     config_key: String,
 }
@@ -219,6 +236,16 @@ impl CloudUi {
     pub fn configured(settings: &Settings) -> bool {
         let (url, key) = cloud::effective(settings);
         cloud::parse_url(&url).is_ok() && !key.is_empty()
+    }
+
+    /// El nombre que la persona eligió en el servidor. Una vez elegido no se puede cambiar (ver `supabase/schema.sql`).
+    pub fn locked_name(&self) -> Option<&str> {
+        self.cloud_name.as_deref()
+    }
+
+    /// El mail de la cuenta con la sesión iniciada, si hay una.
+    pub fn account(&self) -> Option<&str> {
+        self.signed_as.as_deref()
     }
 
     fn send(&mut self, job: Job) {
@@ -253,7 +280,7 @@ impl CloudUi {
     }
 
     /// Recibe lo que terminó el hilo, y cada tanto manda a sincronizar el proyecto abierto. Se llama en cada cuadro.
-    pub fn tick(&mut self, ctx: &egui::Context, now: f64, settings: &Settings, file: Option<&Path>, link: Option<&CloudLink>) -> Out {
+    pub fn tick(&mut self, ctx: &egui::Context, now: f64, settings: &Settings, file: Option<&Path>, link: Option<&CloudLink>, fast: bool) -> Out {
         self.ensure_worker(ctx, settings);
         let mut out = Out::default();
         let mut events = Vec::new();
@@ -269,9 +296,24 @@ impl CloudUi {
                     self.signed_as = Some(email);
                     self.password.clear();
                     self.note.clear();
+                    self.name_loaded = false;
                     self.send(Job::Groups);
+                    self.send(Job::Profile);
+                }
+                Event::Name(name) => {
+                    self.name_loaded = true;
+                    if let Some(n) = &name {
+                        out.name = Some(n.clone());
+                        self.note.clear();
+                    } else {
+                        // Todavía no eligió: la ventana se abre sola para que lo haga.
+                        self.open = true;
+                    }
+                    self.cloud_name = name;
                 }
                 Event::SignedOut => {
+                    self.cloud_name = None;
+                    self.name_loaded = false;
                     self.signed_as = None;
                     self.groups.clear();
                     self.projects.clear();
@@ -338,14 +380,14 @@ impl CloudUi {
         // La sincronización periódica del proyecto abierto.
         if let (Some(file), Some(link), Some(_)) = (file, link, &self.signed_as)
             && !self.syncing
-            && now - self.last_sync > SYNC_SECS
+            && now - self.last_sync > if fast { SYNC_FAST_SECS } else { SYNC_SLOW_SECS }
         {
             self.last_sync = now;
             self.syncing = true;
-            self.send(Job::Sync { file: file.to_path_buf(), link: link.clone() });
+            self.send(Job::Sync { file: file.to_path_buf(), link: link.clone(), who: settings.author() });
         }
         if self.tx.is_some() && file.is_some() && link.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(SYNC_SECS));
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(if fast { SYNC_FAST_SECS } else { SYNC_SLOW_SECS }));
         }
         out
     }
@@ -395,7 +437,7 @@ impl CloudUi {
         }
     }
 
-    /// La ventana de la nube. `file` y `title` son los del proyecto abierto (si está guardado en un archivo).
+    /// La ventana de la cuenta. `file` y `title` son los del proyecto abierto (si está guardado en un archivo).
     pub fn dialog(
         &mut self,
         ctx: &egui::Context,
@@ -414,6 +456,7 @@ impl CloudUi {
         let mut close = false;
         let mut job: Option<Job> = None;
         let configured = Self::configured(settings);
+        let built_in = cloud::has_built_in();
         let signed = self.signed_as.clone();
         let busy = self.busy;
         let mut chosen_group: Option<usize> = None;
@@ -422,6 +465,7 @@ impl CloudUi {
         let mut unlink = false;
         let mut clean = false;
         let mut save_config = false;
+        let author = settings.author();
         let (mut config_url, mut config_key) = (self.config_url.clone(), self.config_key.clone());
         if config_url.is_empty() && config_key.is_empty() {
             config_url = settings.cloud_url.clone();
@@ -431,143 +475,39 @@ impl CloudUi {
             ctx,
             p,
             "cloud",
-            "Nube",
+            "Tu cuenta",
             kit::DialogWidth::Normal,
             |ui| {
-                if !configured {
-                    ui.label("Pegá la dirección y la clave pública de la nube que te pasaron (la «anon» o «publishable»). Nunca pegues una clave secreta: el programa la rechaza.");
-                    ui.add(egui::TextEdit::singleline(&mut config_url).hint_text("https://xxxx.supabase.co").desired_width(f32::INFINITY));
-                    ui.add(egui::TextEdit::singleline(&mut config_key).hint_text("Clave pública (anon)").desired_width(f32::INFINITY));
-                    let ok = cloud::parse_url(&config_url).is_ok() && !config_key.trim().is_empty();
-                    if ui.add_enabled(ok, egui::Button::new("Guardar")).clicked() {
-                        save_config = true;
-                    }
-                    if !config_url.is_empty()
-                        && let Err(why) = cloud::parse_url(&config_url)
-                    {
-                        ui.label(RichText::new(why).color(p.warning));
-                    }
+                if !configured && !built_in {
+                    setup_view(ui, p, &mut config_url, &mut config_key, &mut save_config);
                     return;
                 }
-                let Some(email) = &signed else {
-                    ui.label("Iniciá sesión para compartir y sincronizar proyectos.");
-                    ui.add(egui::TextEdit::singleline(&mut this.email).hint_text("Mail").desired_width(f32::INFINITY));
-                    ui.add(egui::TextEdit::singleline(&mut this.password).password(true).hint_text("Contraseña (10 caracteres o más)").desired_width(f32::INFINITY));
-                    ui.horizontal(|ui| {
-                        let ready = !busy && !this.email.trim().is_empty() && !this.password.is_empty();
-                        if ui.add_enabled(ready, egui::Button::new("Entrar")).clicked() {
-                            job = Some(Job::SignIn(this.email.trim().to_string(), this.password.clone()));
-                        }
-                        if ui.add_enabled(ready, egui::Button::new("Crear cuenta")).clicked() {
-                            job = Some(Job::SignUp(this.email.trim().to_string(), this.password.clone()));
-                        }
-                    });
-                    if !this.note.is_empty() {
-                        ui.label(RichText::new(&this.note).color(p.dim));
-                    }
+                let Some(email) = signed.clone() else {
+                    login_view(ui, p, this, busy, &mut job);
                     return;
                 };
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Sesión: {email}")).color(p.dim));
-                    if ui.button("Salir").clicked() {
-                        sign_out = true;
-                    }
-                });
+                account_header(ui, p, &email, this.cloud_name.as_deref(), &mut sign_out);
                 if !this.note.is_empty() {
-                    ui.label(RichText::new(&this.note).color(p.warning));
+                    message_line(ui, p, &this.note, true);
                 }
-                // Los grupos.
-                kit::section(ui, p, "Grupos", None);
-                if this.groups.is_empty() {
-                    ui.label(RichText::new("Todavía no estás en ningún grupo. Creá uno o entrá con un código.").color(p.dim));
+                // Primero el nombre: sin él no se puede seguir.
+                if this.cloud_name.is_none() {
+                    if this.name_loaded {
+                        name_prompt(ui, p, this, busy, &mut job);
+                    } else {
+                        ui.add_space(tokens::SP_L);
+                        ui.label(RichText::new("Cargando tu cuenta…").color(p.dim));
+                    }
+                    return;
                 }
-                for (i, (_, name, _)) in this.groups.iter().enumerate() {
-                    if ui.selectable_label(this.selected_group == Some(i), name).clicked() {
-                        chosen_group = Some(i);
-                    }
-                }
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut this.new_group).hint_text("Nombre del grupo nuevo").desired_width(200.0));
-                    if ui.add_enabled(!busy && !this.new_group.trim().is_empty(), egui::Button::new("Crear grupo")).clicked() {
-                        job = Some(Job::CreateGroup(this.new_group.trim().to_string()));
-                        this.new_group.clear();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut this.join_code).hint_text("Código de invitación").desired_width(200.0));
-                    if ui.add_enabled(!busy && !this.join_code.trim().is_empty(), egui::Button::new("Entrar con el código")).clicked() {
-                        job = Some(Job::Join(this.join_code.trim().to_string()));
-                    }
-                });
+                groups_view(ui, p, this, busy, &mut job, &mut chosen_group);
                 let Some((group_id, group_name, _)) = this.selected_group.and_then(|i| this.groups.get(i)).cloned() else {
                     return;
                 };
-                // El grupo elegido.
-                kit::section(ui, p, &format!("Grupo «{group_name}»"), None);
-                if let Some((used, quota, count)) = this.usage {
-                    let fraction = if quota > 0 { (used as f32 / quota as f32).clamp(0.0, 1.0) } else { 1.0 };
-                    ui.label(RichText::new(format!("Imágenes: {} de {} ({} en total)", megabytes(used), megabytes(quota), count)).size(tokens::FONT_SMALL));
-                    ui.add(egui::ProgressBar::new(fraction).fill(if fraction > 0.9 { p.warning } else { p.accent }));
-                    if fraction > 0.8 {
-                        ui.label(RichText::new("El espacio para imágenes está casi lleno: conviene quitar las que no se usan.").size(tokens::FONT_SMALL).color(p.warning));
-                    }
-                }
-                if unused_images > 0 {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{unused_images} imágenes de este proyecto ya no se usan.")).size(tokens::FONT_SMALL));
-                        if ui.button("Quitarlas de la nube").clicked() {
-                            clean = true;
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!busy, egui::Button::new("Crear código de invitación")).clicked() {
-                        job = Some(Job::Invite(group_id.clone()));
-                    }
-                });
-                if let Some(code) = &this.invite {
-                    ui.label(RichText::new("Pasale este código a quien quieras sumar. Vale 7 días y se muestra una sola vez:").size(tokens::FONT_SMALL).color(p.dim));
-                    let mut shown = code.clone();
-                    ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
-                }
-                // El proyecto abierto.
-                kit::section(ui, p, "Este proyecto", None);
-                match (file, link) {
-                    (Some(_), Some(l)) if l.group == group_id => {
-                        ui.label(RichText::new("Se sincroniza solo con la nube.").color(p.success));
-                        if ui.button("Dejar de sincronizar").clicked() {
-                            unlink = true;
-                        }
-                    }
-                    (Some(_), Some(_)) => {
-                        ui.label(RichText::new("Este proyecto está unido a otro grupo.").color(p.dim));
-                    }
-                    (Some(_), None) => {
-                        ui.add(egui::TextEdit::singleline(&mut this.share_name).hint_text(title).desired_width(260.0));
-                        if ui.add_enabled(!busy, egui::Button::new("Compartir este proyecto en el grupo")).clicked() {
-                            let name = if this.share_name.trim().is_empty() { title.to_string() } else { this.share_name.trim().to_string() };
-                            if let Some(file) = file {
-                                job = Some(Job::Share { group: group_id.clone(), name, file: file.to_path_buf() });
-                            }
-                        }
-                    }
-                    (None, _) => {
-                        ui.label(RichText::new("Guardá el proyecto en un archivo para poder compartirlo.").color(p.dim));
-                    }
-                }
-                // Los proyectos del grupo.
-                kit::section(ui, p, "Proyectos del grupo", None);
-                if this.projects.is_empty() {
-                    ui.label(RichText::new("Todavía no hay proyectos compartidos en este grupo.").color(p.dim));
-                }
-                for (id, name) in &this.projects {
-                    ui.horizontal(|ui| {
-                        ui.label(name);
-                        if ui.add_enabled(!busy, egui::Button::new("Abrir una copia")).clicked() {
-                            open_dest = Some((id.clone(), name.clone()));
-                        }
-                    });
-                }
+                group_view(
+                    ui, p, this, busy, &group_id, &group_name, file, title, link, unused_images, &author,
+                    &mut job, &mut unlink, &mut clean, &mut open_dest,
+                );
             },
             |ui| {
                 if ui.button("Cerrar").clicked() {
@@ -608,5 +548,311 @@ impl CloudUi {
             self.open = false;
         }
         out
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Las partes de la ventana
+// ------------------------------------------------------------------------------------------------
+
+/// Un mensaje con su color: rojo si es un problema, el tono normal si es información.
+fn message_line(ui: &mut egui::Ui, p: &Palette, text: &str, problem: bool) {
+    egui::Frame::new()
+        .fill(theme::mix(p.container, if problem { p.warning } else { p.accent }, 0.14))
+        .corner_radius(tokens::R_CONTROL)
+        .inner_margin(egui::Margin::symmetric(tokens::SP_M as i8, tokens::SP_S as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(text).size(tokens::FONT_SMALL).color(p.text)).wrap());
+        });
+}
+
+/// Un círculo con una letra o un icono (el «avatar» de la cuenta).
+fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32, font: egui::FontId, ink: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), size / 2.0, color);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, font, ink);
+}
+
+/// Un campo con su rótulo arriba, a todo el ancho.
+fn labeled(ui: &mut egui::Ui, p: &Palette, label: &str, add: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
+    ui.label(RichText::new(label).size(tokens::FONT_SMALL).color(p.dim));
+    ui.add_space(2.0);
+    let resp = add(ui);
+    ui.add_space(tokens::SP_S);
+    resp
+}
+
+/// Cuando la nube todavía no está configurada (la versión sin la nube incorporada).
+fn setup_view(ui: &mut egui::Ui, p: &Palette, url: &mut String, key: &mut String, save: &mut bool) {
+    ui.vertical_centered(|ui| {
+        badge(ui, theme_icon(), p.container_hi, 44.0, egui::FontId::proportional(22.0), p.accent);
+        ui.add_space(tokens::SP_S);
+        ui.label(RichText::new("Conectar con la nube").font(egui::FontId::new(tokens::FONT_CARD_TITLE, theme::bold_family())).color(p.text));
+        ui.label(RichText::new("Pegá la dirección y la clave pública que te pasaron.").color(p.dim));
+    });
+    ui.add_space(tokens::SP_M);
+    labeled(ui, p, "Dirección", |ui| ui.add(egui::TextEdit::singleline(url).hint_text("https://xxxx.supabase.co").desired_width(f32::INFINITY)));
+    labeled(ui, p, "Clave pública", |ui| ui.add(egui::TextEdit::singleline(key).hint_text("anon o publishable").desired_width(f32::INFINITY)));
+    ui.label(RichText::new("Nunca pegues una clave secreta: el programa la rechaza.").size(tokens::FONT_SMALL).color(p.dim));
+    if !url.is_empty()
+        && let Err(why) = cloud::parse_url(url)
+    {
+        message_line(ui, p, &why, true);
+    }
+    ui.add_space(tokens::SP_S);
+    let ok = cloud::parse_url(url).is_ok() && !key.trim().is_empty();
+    if kit::primary_button(ui, p, "Guardar", (!ok).then_some("Falta la dirección o la clave")).clicked() {
+        *save = true;
+    }
+}
+
+fn theme_icon() -> &'static str {
+    crate::icon::CLOUD
+}
+
+/// Iniciar sesión o crear una cuenta.
+fn login_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, job: &mut Option<Job>) {
+    ui.vertical_centered(|ui| {
+        badge(ui, theme_icon(), theme::mix(p.container, p.accent, 0.25), 52.0, egui::FontId::proportional(26.0), p.accent);
+        ui.add_space(tokens::SP_S);
+        ui.label(RichText::new("Tu cuenta").font(egui::FontId::new(tokens::FONT_TITLE, theme::bold_family())).color(p.text));
+        ui.label(RichText::new("Entrá para compartir proyectos y trabajar en equipo.").color(p.dim));
+    });
+    ui.add_space(tokens::SP_M);
+    if let Some(i) = kit::segmented(ui, p, &["Entrar", "Crear cuenta"], this.login_mode) {
+        this.login_mode = i;
+        this.note.clear();
+    }
+    ui.add_space(tokens::SP_M);
+    let signup = this.login_mode == 1;
+    let email = labeled(ui, p, "Mail", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut this.email).hint_text("nombre@ejemplo.com").desired_width(f32::INFINITY))
+    });
+    let mut enter = email.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    ui.label(RichText::new(if signup { "Contraseña (10 caracteres o más)" } else { "Contraseña" }).size(tokens::FONT_SMALL).color(p.dim));
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        let width = ui.available_width() - tokens::ICON_BTN - tokens::SP_S;
+        let resp = ui.add(egui::TextEdit::singleline(&mut this.password).password(!this.show_password).desired_width(width));
+        enter |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let eye = if this.show_password { crate::icon::EYE_SLASH } else { crate::icon::EYE };
+        if kit::icon_button(ui, p, eye, if this.show_password { "Ocultar la contraseña" } else { "Mostrar la contraseña" }, true).clicked() {
+            this.show_password = !this.show_password;
+        }
+    });
+    ui.add_space(tokens::SP_M);
+    let missing = if this.email.trim().is_empty() {
+        Some("Falta el mail")
+    } else if this.password.is_empty() {
+        Some("Falta la contraseña")
+    } else if signup && this.password.chars().count() < 10 {
+        Some("La contraseña tiene que tener al menos 10 caracteres")
+    } else if busy {
+        Some("Un momento…")
+    } else {
+        None
+    };
+    let label = match (busy, signup) {
+        (true, _) => "Un momento…",
+        (false, false) => "Entrar",
+        (false, true) => "Crear cuenta",
+    };
+    ui.add_sized([ui.available_width(), tokens::CONTROL_H + 4.0], |ui: &mut egui::Ui| {
+        let clicked = kit::primary_button(ui, p, label, missing).clicked();
+        if (clicked || (enter && missing.is_none())) && missing.is_none() {
+            let (email, password) = (this.email.trim().to_string(), this.password.clone());
+            *job = Some(if signup { Job::SignUp(email, password) } else { Job::SignIn(email, password) });
+        }
+        ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
+    });
+    if !this.note.is_empty() {
+        ui.add_space(tokens::SP_S);
+        message_line(ui, p, &this.note, !this.note.contains("Te mandamos"));
+    }
+    if signup {
+        ui.add_space(tokens::SP_S);
+        ui.label(RichText::new("Te vamos a mandar un mail para confirmar la cuenta.").size(tokens::FONT_SMALL).color(p.dim));
+    }
+}
+
+/// El nombre se elige una vez, y lo ven los demás.
+fn name_prompt(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, job: &mut Option<Job>) {
+    ui.add_space(tokens::SP_M);
+    kit::card(ui, p, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new("Elegí tu nombre").font(egui::FontId::new(tokens::FONT_CARD_TITLE, theme::bold_family())).color(p.text));
+        ui.label(RichText::new("Es el que ven los demás en los avisos y en quién está conectado.").color(p.dim));
+        ui.add_space(tokens::SP_S);
+        let resp = ui.add(egui::TextEdit::singleline(&mut this.name_input).hint_text("Por ejemplo, Ana López").desired_width(f32::INFINITY));
+        let valid = cloud::valid_display_name(&this.name_input);
+        if !this.name_input.trim().is_empty() && !valid {
+            ui.label(RichText::new("De 3 a 30 letras, números, espacios, puntos o guiones.").size(tokens::FONT_SMALL).color(p.warning));
+        }
+        ui.add_space(tokens::SP_S);
+        message_line(ui, p, "Una vez elegido no se puede cambiar.", false);
+        ui.add_space(tokens::SP_S);
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let why = if !valid { Some("Escribí un nombre válido") } else if busy { Some("Un momento…") } else { None };
+        if (kit::primary_button(ui, p, "Guardar mi nombre", why).clicked() || (enter && why.is_none())) && why.is_none() {
+            *job = Some(Job::SetName(this.name_input.trim().to_string()));
+        }
+    });
+}
+
+/// Quién está dentro: su círculo con la inicial (del color de su nombre), el nombre y el mail.
+fn account_header(ui: &mut egui::Ui, p: &Palette, email: &str, name: Option<&str>, sign_out: &mut bool) {
+    kit::card(ui, p, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let shown = name.unwrap_or(email);
+            let color = theme::character_color(shown);
+            let initial = shown.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+            badge(ui, &initial, color, 40.0, egui::FontId::new(18.0, theme::bold_family()), theme::ink_on(color, p));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(name.unwrap_or("Sin nombre todavía")).font(egui::FontId::new(tokens::FONT_BODY, theme::bold_family())).color(p.text));
+                    if name.is_some() {
+                        ui.label(RichText::new(crate::icon::LOCK_SIMPLE).size(tokens::ICON_S).color(p.dim))
+                            .on_hover_text("El nombre no se puede cambiar");
+                    }
+                });
+                ui.label(RichText::new(email).size(tokens::FONT_SMALL).color(p.dim));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(format!("{}  Salir", crate::icon::SIGN_OUT)).clicked() {
+                    *sign_out = true;
+                }
+            });
+        });
+    });
+}
+
+/// Los grupos de la persona, para elegir uno, y crear uno o entrar con un código.
+fn groups_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, job: &mut Option<Job>, chosen: &mut Option<usize>) {
+    kit::section(ui, p, "Grupos", None);
+    if this.groups.is_empty() {
+        ui.label(RichText::new("Todavía no estás en ningún grupo. Creá uno o entrá con un código.").color(p.dim));
+    }
+    ui.horizontal_wrapped(|ui| {
+        for (i, (_, name, _)) in this.groups.iter().enumerate() {
+            let on = this.selected_group == Some(i);
+            let text = RichText::new(name).color(if on { p.on_accent } else { p.text });
+            let button = egui::Button::new(text).fill(if on { p.accent } else { p.container });
+            if ui.add(button).clicked() {
+                *chosen = Some(i);
+            }
+        }
+    });
+    ui.add_space(tokens::SP_S);
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut this.new_group).hint_text("Nombre del grupo nuevo").desired_width(ui.available_width() - 110.0));
+        if ui.add_enabled(!busy && !this.new_group.trim().is_empty(), egui::Button::new(format!("{}  Crear", crate::icon::PLUS))).clicked() {
+            *job = Some(Job::CreateGroup(this.new_group.trim().to_string()));
+            this.new_group.clear();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut this.join_code).hint_text("Código de invitación").desired_width(ui.available_width() - 110.0));
+        if ui.add_enabled(!busy && !this.join_code.trim().is_empty(), egui::Button::new("Entrar")).clicked() {
+            *job = Some(Job::Join(this.join_code.trim().to_string()));
+        }
+    });
+}
+
+/// El grupo elegido: su espacio de imágenes, invitaciones, el proyecto abierto y los proyectos compartidos.
+#[allow(clippy::too_many_arguments)]
+fn group_view(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    this: &mut CloudUi,
+    busy: bool,
+    group_id: &str,
+    group_name: &str,
+    file: Option<&Path>,
+    title: &str,
+    link: Option<&CloudLink>,
+    unused_images: usize,
+    author: &str,
+    job: &mut Option<Job>,
+    unlink: &mut bool,
+    clean: &mut bool,
+    open_dest: &mut Option<(String, String)>,
+) {
+    kit::section(ui, p, &format!("Grupo «{group_name}»"), None);
+    kit::card(ui, p, |ui| {
+        ui.set_width(ui.available_width());
+        if let Some((used, quota, count)) = this.usage {
+            let fraction = if quota > 0 { (used as f32 / quota as f32).clamp(0.0, 1.0) } else { 1.0 };
+            ui.label(RichText::new(format!("Imágenes: {} de {} ({} en total)", megabytes(used), megabytes(quota), count)).size(tokens::FONT_SMALL).color(p.dim));
+            ui.add(egui::ProgressBar::new(fraction).fill(if fraction > 0.9 { p.warning } else { p.accent }));
+            if fraction > 0.8 {
+                ui.label(RichText::new("El espacio para imágenes está casi lleno: conviene quitar las que no se usan.").size(tokens::FONT_SMALL).color(p.warning));
+            }
+            ui.add_space(tokens::SP_S);
+        }
+        if unused_images > 0 {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{unused_images} imágenes de este proyecto ya no se usan.")).size(tokens::FONT_SMALL));
+                if ui.button("Quitarlas de la nube").clicked() {
+                    *clean = true;
+                }
+            });
+        }
+        if ui.add_enabled(!busy, egui::Button::new(format!("{}  Código de invitación", crate::icon::LINK_SIMPLE))).clicked() {
+            *job = Some(Job::Invite(group_id.to_string()));
+        }
+        if let Some(code) = &this.invite {
+            ui.label(RichText::new("Pasale este código a quien quieras sumar. Vale 7 días y se muestra una sola vez:").size(tokens::FONT_SMALL).color(p.dim));
+            let mut shown = code.clone();
+            ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
+        }
+    });
+    // El proyecto abierto (desde la pantalla de inicio no hay ninguno).
+    if !title.is_empty() {
+        kit::section(ui, p, "Este proyecto", None);
+        kit::card(ui, p, |ui| {
+            ui.set_width(ui.available_width());
+            match (file, link) {
+                (Some(_), Some(l)) if l.group == group_id => {
+                    ui.label(RichText::new(format!("{}  Se sincroniza solo con la nube.", crate::icon::CHECK_CIRCLE)).color(p.success));
+                    if ui.button("Dejar de sincronizar").clicked() {
+                        *unlink = true;
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    ui.label(RichText::new("Este proyecto está unido a otro grupo.").color(p.dim));
+                }
+                (Some(f), None) => {
+                    ui.add(egui::TextEdit::singleline(&mut this.share_name).hint_text(title).desired_width(f32::INFINITY));
+                    ui.add_space(tokens::SP_XS);
+                    if ui.add_enabled(!busy, egui::Button::new("Compartir este proyecto en el grupo")).clicked() {
+                        let name = if this.share_name.trim().is_empty() { title.to_string() } else { this.share_name.trim().to_string() };
+                        *job = Some(Job::Share { group: group_id.to_string(), name, file: f.to_path_buf(), who: author.to_string() });
+                    }
+                }
+                (None, _) => {
+                    ui.label(RichText::new("Guardá el proyecto en un archivo para poder compartirlo.").color(p.dim));
+                }
+            }
+        });
+    }
+    kit::section(ui, p, "Proyectos del grupo", None);
+    if this.projects.is_empty() {
+        ui.label(RichText::new("Todavía no hay proyectos compartidos en este grupo.").color(p.dim));
+    }
+    for (id, name) in &this.projects {
+        kit::card(ui, p, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name).color(p.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Abrir una copia")).clicked() {
+                        *open_dest = Some((id.clone(), name.clone()));
+                    }
+                });
+            });
+        });
     }
 }

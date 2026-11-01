@@ -345,6 +345,17 @@ struct Conflict {
     theirs: Vec<u8>,
 }
 
+/// Un aviso de que otra persona cambió algo: quién, qué parte y qué cambió.
+struct ChangeToast {
+    who: String,
+    section: String,
+    lines: Vec<String>,
+    born: std::time::Instant,
+}
+
+/// Cuánto se queda en pantalla un aviso de cambios.
+const CHANGE_TOAST_SECS: u64 = 15;
+
 /// Cada cuántos segundos se mira si otra persona cambió algo en la carpeta del proyecto.
 const POLL_SECS: f64 = 3.0;
 
@@ -404,10 +415,14 @@ pub struct ScriptApp {
     roles: crate::roles::RoleState,
     versions: VersionsState,
     last_version: f64,
+    /// Cuándo fue el último cambio sin guardar (en segundos de la ventana): decide qué tan seguido se sincroniza.
+    last_edit: f64,
     cloud: cloud_ui::CloudUi,
     cloud_link: Option<CloudLink>,
     /// Quién más está en el proyecto compartido (se renueva cada pocos segundos).
     peers: Vec<crate::cloud::Peer>,
+    /// Avisos de lo que cambiaron otras personas.
+    change_toasts: Vec<ChangeToast>,
     /// Lo último que se leyó o se escribió de la carpeta del proyecto, por sección: la base para combinar cambios.
     known: std::collections::BTreeMap<String, Vec<u8>>,
     stamps: folder::Stamps,
@@ -500,9 +515,11 @@ impl ScriptApp {
             roles: Default::default(),
             versions: Default::default(),
             last_version: 0.0,
+            last_edit: f64::MIN,
             cloud: Default::default(),
             cloud_link: None,
             peers: Vec::new(),
+            change_toasts: Vec::new(),
             known: Default::default(),
             stamps: Default::default(),
             last_poll: 0.0,
@@ -901,6 +918,13 @@ impl ScriptApp {
         if let Some(message) = out.message {
             self.status = message;
         }
+        if let Some(name) = out.name {
+            // El nombre de la cuenta manda: es el que firma todo y no se puede cambiar.
+            if self.settings.user_name != name {
+                self.settings.user_name = name;
+                self.settings.save();
+            }
+        }
         if out.settings_changed {
             self.settings.save();
         }
@@ -1025,9 +1049,19 @@ impl ScriptApp {
         let empty = b"{}".to_vec();
         let mut merged = mine.clone();
         let (mut applied, mut combined) = (Vec::new(), false);
+        let mut told: Vec<ChangeToast> = Vec::new();
         for name in changed {
             let theirs = &disk[&name];
             let base = self.known.get(&name);
+            // Qué cambió, para avisarlo con su contenido.
+            let lines = folder::describe_change(base.map_or(&empty[..], |b| b.as_slice()), theirs, 5);
+            let who = self
+                .cloud_link
+                .as_ref()
+                .and_then(|l| l.authors.get(&name))
+                .filter(|w| !w.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "Otra persona".to_string());
             if mine.get(&name) == base {
                 merged.insert(name.clone(), theirs.clone());
             } else {
@@ -1047,6 +1081,9 @@ impl ScriptApp {
                 }
             }
             self.known.insert(name.clone(), theirs.clone());
+            if !lines.is_empty() {
+                told.push(ChangeToast { who, section: name.clone(), lines, born: std::time::Instant::now() });
+            }
             applied.push(name);
         }
         if !applied.is_empty()
@@ -1057,8 +1094,16 @@ impl ScriptApp {
                 // Lo combinado todavía no está en el archivo: hay que guardarlo.
                 self.dirty = true;
             }
-            let names: Vec<&str> = applied.iter().map(|n| section_name(n)).collect();
-            self.status = format!("Otra persona cambió: {}. Ya está actualizado.", names.join(", "));
+            // El aviso muestra qué cambió; si no se pudo describir, queda el mensaje corto en la barra de estado.
+            if told.is_empty() {
+                let names: Vec<&str> = applied.iter().map(|n| section_name(n)).collect();
+                self.status = format!("Otra persona cambió: {}. Ya está actualizado.", names.join(", "));
+            }
+            if self.settings.notifications {
+                self.change_toasts.extend(told);
+            }
+            let excess = self.change_toasts.len().saturating_sub(4);
+            self.change_toasts.drain(..excess);
         }
         if !self.conflicts.is_empty() {
             self.conflicts_open = true;
@@ -1145,8 +1190,62 @@ impl ScriptApp {
 
     /// Con qué nombre se firman las versiones: el que puso la persona o, si no puso ninguno, el del usuario del sistema.
     fn author_name(&self) -> String {
-        let name = self.settings.user_name.trim();
-        if name.is_empty() { storage::os_user_name() } else { name.to_string() }
+        self.settings.author()
+    }
+
+    /// Los avisos de lo que cambiaron otras personas: una tarjeta por aviso, con el color de quien lo hizo. Se cierran con un clic o
+    /// solos a los 15 segundos.
+    fn change_toasts_ui(&mut self, ctx: &egui::Context, p: &Palette) {
+        self.change_toasts.retain(|t| t.born.elapsed().as_secs() < CHANGE_TOAST_SECS);
+        if !self.settings.notifications {
+            self.change_toasts.clear();
+        }
+        if self.change_toasts.is_empty() {
+            return;
+        }
+        let mut dismissed: Option<usize> = None;
+        egui::Area::new(egui::Id::unique("change_toasts"))
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-tokens::SP_L, -(tokens::STATUS_H + tokens::SP_L)))
+            .show(ctx, |ui| {
+                ui.set_max_width(340.0);
+                for (i, toast) in self.change_toasts.iter().enumerate() {
+                    let color = theme::character_color(&toast.who);
+                    let resp = egui::Frame::new()
+                        .fill(theme::mix(p.container_hi, color, 0.14))
+                        .stroke(Stroke::new(1.5, color))
+                        .corner_radius(tokens::R_CARD)
+                        .shadow(egui::Shadow { offset: [0, 2], blur: 8, spread: 0, color: p.shadow })
+                        .inner_margin(egui::Margin::symmetric(tokens::SP_M as i8, tokens::SP_S as i8))
+                        .show(ui, |ui| {
+                            ui.set_width(316.0);
+                            ui.horizontal(|ui| {
+                                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                ui.painter().circle_filled(dot.center(), 5.0, color);
+                                ui.label(
+                                    RichText::new(format!("{} cambió {}", toast.who, section_name(&toast.section)))
+                                        .font(egui::FontId::new(tokens::FONT_BODY, theme::bold_family()))
+                                        .color(p.text),
+                                );
+                            });
+                            for line in &toast.lines {
+                                ui.add(egui::Label::new(RichText::new(line).size(tokens::FONT_SMALL).color(p.text)).wrap());
+                            }
+                        })
+                        .response
+                        .interact(egui::Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Clic para cerrar");
+                    if resp.clicked() {
+                        dismissed = Some(i);
+                    }
+                    ui.add_space(tokens::SP_XS);
+                }
+            });
+        if let Some(i) = dismissed {
+            self.change_toasts.remove(i);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 
     /// Guarda una versión en el historial (junto al proyecto). Las automáticas no se guardan si no cambió nada.
@@ -1214,6 +1313,7 @@ impl ScriptApp {
         let mut pick: Option<usize> = None;
         let project = &self.project;
         let user = &mut self.settings.user_name;
+        let name_locked = self.cloud.locked_name().is_some();
         let now = storage::now_unix();
         kit::dialog(
             ctx,
@@ -1230,7 +1330,11 @@ impl ScriptApp {
                 ui.horizontal(|ui| {
                     ui.label("Tu nombre");
                     renamed = ui
-                        .add(egui::TextEdit::singleline(user).desired_width(160.0).hint_text("Cómo te llamás"))
+                        .add_enabled(
+                            !name_locked,
+                            egui::TextEdit::singleline(user).desired_width(160.0).hint_text("Cómo te llamás"),
+                        )
+                        .on_disabled_hover_text("El nombre de tu cuenta no se puede cambiar")
                         .changed();
                 });
                 ui.horizontal(|ui| {
@@ -2498,6 +2602,7 @@ impl ScriptApp {
 
     /// Ajustes: dentro del marco del proyecto, o sin él si se abrieron desde Inicio.
     fn settings_screen(&mut self, ui: &mut egui::Ui, p: &Palette, bare: bool) {
+        self.settings.name_locked = self.cloud.locked_name().is_some();
         use crate::screens::SettingsScreen;
         let key = "settings".to_string();
         let history: Vec<String> = Vec::new();
@@ -2697,6 +2802,7 @@ impl ScriptApp {
         } else {
             self.show_right
         };
+        let mut notifications = self.settings.notifications;
         shell::status_bar(
             ui,
             p,
@@ -2706,9 +2812,14 @@ impl ScriptApp {
                 info: &info,
                 sidebar: &mut sidebar,
                 inspector: has_inspector.then_some(&mut inspector),
+                notifications: &mut notifications,
             },
         );
         self.show_sidebar = sidebar;
+        if notifications != self.settings.notifications {
+            self.settings.notifications = notifications;
+            self.settings.save();
+        }
         if has_inspector {
             if self.compact_inspector {
                 self.drawer_open = inspector;
@@ -2782,6 +2893,7 @@ impl ScriptApp {
         }
         self.add_dialog(ui.ctx(), p, &page);
         self.versions_dialog(ui.ctx(), p);
+        self.change_toasts_ui(ui.ctx(), p);
         {
             let (file, link, title) = (self.path.clone(), self.cloud_link.clone(), self.project.title.clone());
             let unused = self.unused_cloud_images().len();
@@ -3475,11 +3587,27 @@ impl ScriptApp {
 
     fn home_screen(&mut self, ui: &mut egui::Ui) {
         let p = self.settings.scheme.palette();
+        // La cuenta se puede abrir antes de entrar a un proyecto: la ventana de la nube y su hilo funcionan también acá.
+        {
+            let ctx = ui.ctx().clone();
+            let now = ctx.input(|i| i.time);
+            let out = self.cloud.tick(&ctx, now, &self.settings, None, None, false);
+            self.apply_cloud(out);
+            let out = self.cloud.dialog(&ctx, &p, &mut self.settings, None, "", None, 0);
+            self.apply_cloud(out);
+        }
         if self.show_settings {
             self.settings_screen(ui, &p, true);
             return;
         }
         let mut action = None;
+        let account = match self.cloud.account() {
+            Some(email) => {
+                let name = self.settings.user_name.trim();
+                if name.is_empty() { email.to_string() } else { name.to_string() }
+            }
+            None => "Iniciar sesión".to_string(),
+        };
         let history: Vec<String> = Vec::new();
         let mut cx = ScreenCx::new(
             &mut self.project,
@@ -3493,6 +3621,7 @@ impl ScriptApp {
             &mut crate::screens::HomeScreen {
                 cards: &self.cards,
                 action: &mut action,
+                account: &account,
             },
             &mut cx,
         );
@@ -3501,6 +3630,7 @@ impl ScriptApp {
             Some(HomeAction::Open) => self.open_dialog(),
             Some(HomeAction::OpenRecent(path)) => self.open_path(&path),
             Some(HomeAction::Settings) => self.show_settings = true,
+            Some(HomeAction::Cloud) => self.cloud.open = true,
             None => {}
         }
     }
@@ -3617,7 +3747,9 @@ impl ScriptApp {
             }
             // Guardado automático: solo si hay cambios y como máximo cada `AUTOSAVE_SECS`, para no escribir de más en el disco.
             let now = ctx.input(|i| i.time);
-            if self.settings.autosave && self.dirty && now - self.last_autosave > AUTOSAVE_SECS {
+            // En un proyecto compartido se guarda enseguida (solo en la carpeta local): así lo que se escribe sale hacia los demás sin demora.
+            let autosave_every = if self.cloud_link.is_some() { 2.0 } else { AUTOSAVE_SECS };
+            if self.settings.autosave && self.dirty && now - self.last_autosave > autosave_every {
                 self.last_autosave = now;
                 if self.path.is_some() {
                     self.save(false);
@@ -3634,7 +3766,12 @@ impl ScriptApp {
             // La nube: recibe lo que terminó el hilo y manda a sincronizar cada tanto.
             {
                 let (file, link) = (self.path.clone(), self.cloud_link.clone());
-                let out = self.cloud.tick(&ctx, now, &self.settings, file.as_deref(), link.as_ref());
+                // Rápido si hay otra persona en el proyecto o se editó hace poco; si no, despacio.
+                if self.dirty {
+                    self.last_edit = now;
+                }
+                let fast = !self.peers.is_empty() || now - self.last_edit < 20.0;
+                let out = self.cloud.tick(&ctx, now, &self.settings, file.as_deref(), link.as_ref(), fast);
                 self.apply_cloud(out);
                 // Dónde estoy, para que los demás lo vean.
                 let (screen, detail) = self.presence_of(&page);
@@ -3647,7 +3784,8 @@ impl ScriptApp {
                     self.last_poll = now;
                     self.poll_external(false);
                 }
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(POLL_SECS));
+                // En un proyecto compartido se revisa más seguido (el guardado y la sincronización dependen de eso).
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(if self.cloud_link.is_some() { 1.0 } else { POLL_SECS }));
             }
             // Una versión del historial, sola, cada media hora de trabajo (si algo cambió).
             if self.path.is_some() && now - self.last_version > AUTO_VERSION_SECS {
@@ -5165,7 +5303,14 @@ mod tests {
         other_person_edits(&file, "Ana abre la puerta.", "Ana abre la ventana.");
         app.poll_external(true);
         assert_eq!(app.project.paragraphs[1].text, "Ana abre la ventana.");
-        assert!(app.status.contains("Otra persona cambió"), "{}", app.status);
+        // El aviso dice qué cambió, con su contenido.
+        assert_eq!(app.change_toasts.len(), 1);
+        assert_eq!(app.change_toasts[0].section, "guion");
+        assert!(
+            app.change_toasts[0].lines.iter().any(|l| l.contains("Ana abre la ventana.")),
+            "{:?}",
+            app.change_toasts[0].lines
+        );
         assert!(!app.dirty, "lo traído ya está en el archivo");
         assert!(app.conflicts.is_empty());
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
