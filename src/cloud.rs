@@ -51,7 +51,8 @@ const MAX_JSON_BYTES: usize = 6 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloudError {
     /// No hay conexión (o el servidor no contesta).
-    Offline,
+    /// No se pudo hablar con el servidor; lleva la causa en una frase.
+    Offline(&'static str),
     NotSignedIn,
     BadLogin,
     Forbidden,
@@ -71,7 +72,7 @@ impl CloudError {
     /// El texto para la persona. No incluye nada de lo que contestó el servidor.
     pub fn message(&self) -> String {
         match self {
-            CloudError::Offline => "No hay conexión con la nube.".into(),
+            CloudError::Offline(why) => format!("No hay conexión con la nube ({why})."),
             CloudError::NotSignedIn => "Tenés que iniciar sesión.".into(),
             CloudError::BadLogin => "El mail o la contraseña no son correctos.".into(),
             CloudError::Forbidden => "No tenés permiso para hacer eso.".into(),
@@ -121,6 +122,12 @@ fn map_error(status: u16, body: &[u8]) -> CloudError {
 // ------------------------------------------------------------------------------------------------
 // Validaciones estrictas
 // ------------------------------------------------------------------------------------------------
+
+/// El código del mail de recuperación: solo números (Supabase usa 6, y se puede configurar hasta 10).
+pub fn is_recovery_code(code: &str) -> bool {
+    let code = code.trim();
+    (6..=10).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_digit())
+}
 
 /// La URL del proyecto de Supabase, normalizada. Solo `https://`, sin usuario ni contraseña, sin camino, sin parámetros y con un
 /// nombre de servidor de letras, números, puntos y guiones.
@@ -260,6 +267,7 @@ pub fn image_path(group: &str, project: &str, hash: &str, ext: &str) -> Result<S
 pub enum Method {
     Get,
     Post,
+    Put,
     Delete,
 }
 
@@ -292,10 +300,34 @@ pub struct HttpsTransport {
     base: String,
 }
 
+/// Una frase sobre por qué falló el pedido, sin datos de la conexión: ayuda a distinguir un problema de la red (cortafuegos,
+/// antivirus, proxy) de uno de la dirección.
+fn why_offline(error: &ureq::Error) -> &'static str {
+    use ureq::Error;
+    match error {
+        Error::HostNotFound => "no se encontró el servidor: revisá la dirección o el DNS",
+        Error::Timeout(_) => "se agotó el tiempo de espera",
+        Error::ConnectionFailed => "no se pudo conectar: puede bloquearlo un cortafuegos, un antivirus o un proxy",
+        Error::Tls(_) | Error::Rustls(_) | Error::Pem(_) => {
+            "falló la conexión segura: el certificado no se aceptó, quizá la red o el antivirus intercepta las conexiones"
+        }
+        Error::InvalidProxyUrl => "la configuración del proxy no es válida",
+        Error::Io(_) => "se cortó la conexión",
+        _ => "error de red",
+    }
+}
+
 impl HttpsTransport {
     pub fn new(base_url: &str) -> Result<Self, String> {
         let base = parse_url(base_url)?;
-        let agent: ureq::Agent = ureq::Agent::config_builder()
+        let builder = ureq::Agent::config_builder();
+        // En Windows se confía en los certificados del sistema, como el resto de los programas: así funcionan las redes y
+        // antivirus que revisan las conexiones con su propio certificado.
+        #[cfg(windows)]
+        let builder = builder.tls_config(
+            ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build(),
+        );
+        let agent: ureq::Agent = builder
             .https_only(!cfg!(test))
             .max_redirects(0)
             .http_status_as_error(false)
@@ -332,6 +364,16 @@ impl Transport for HttpsTransport {
                 }
                 r.call()
             }
+            Method::Put => {
+                let mut r = self.agent.put(&url);
+                for (k, v) in &request.query {
+                    r = r.query(k, v);
+                }
+                for (k, v) in &request.headers {
+                    r = r.header(k, v);
+                }
+                r.send(&request.body[..])
+            }
             Method::Post => {
                 let mut r = self.agent.post(&url);
                 for (k, v) in &request.query {
@@ -343,7 +385,7 @@ impl Transport for HttpsTransport {
                 r.send(&request.body[..])
             }
         };
-        let mut response = result.map_err(|_| CloudError::Offline)?;
+        let mut response = result.map_err(|e| CloudError::Offline(why_offline(&e)))?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
@@ -545,6 +587,57 @@ impl<T: Transport> Client<T> {
             Ok(SignUp::SignedIn)
         } else {
             Ok(SignUp::NeedsConfirmation)
+        }
+    }
+
+    /// Pide el mail con el código para recuperar la contraseña. Supabase contesta lo mismo exista la cuenta o no, así que no
+    /// se puede usar para averiguar quién tiene cuenta.
+    pub fn request_recovery(&mut self, email: &str) -> Result<(), CloudError> {
+        if !is_email_shape(email) {
+            return Err(CloudError::Invalid("El mail no parece válido.".into()));
+        }
+        let body = json!({"email": email.trim()}).to_string().into_bytes();
+        let request = self.request(Method::Post, "/auth/v1/recover", Vec::new(), body, MAX_JSON_BYTES);
+        self.send_json(request).map(|_| ())
+    }
+
+    /// Con el código del mail, elige una contraseña nueva y deja la sesión iniciada.
+    pub fn reset_password(&mut self, email: &str, code: &str, new_password: &str) -> Result<(), CloudError> {
+        if !is_email_shape(email) {
+            return Err(CloudError::Invalid("El mail no parece válido.".into()));
+        }
+        if !is_recovery_code(code) {
+            return Err(CloudError::Invalid("El código son solo números (los que vienen en el mail).".into()));
+        }
+        if new_password.chars().count() < 10 || new_password.len() > 256 {
+            return Err(CloudError::Invalid("La contraseña tiene que tener al menos 10 caracteres.".into()));
+        }
+        let wrong_code = |e: CloudError| match e {
+            CloudError::BadLogin | CloudError::Forbidden | CloudError::NotSignedIn => {
+                CloudError::Invalid("El código no es correcto o ya venció. Pedí uno nuevo.".into())
+            }
+            other => other,
+        };
+        let body = json!({"type": "recovery", "email": email.trim(), "token": code.trim()}).to_string().into_bytes();
+        let request = self.request(Method::Post, "/auth/v1/verify", Vec::new(), body, MAX_JSON_BYTES);
+        let value = self.send_json(request).map_err(wrong_code)?;
+        let session = self.session_from(&value)?;
+        // Con esa sesión (todavía solo en memoria) se cambia la contraseña; si falla, no queda nada guardado.
+        self.session = Some(session.clone());
+        let body = json!({"password": new_password}).to_string().into_bytes();
+        let request = self.request(Method::Put, "/auth/v1/user", Vec::new(), body, MAX_JSON_BYTES);
+        match self.send_json(request) {
+            Ok(_) => {
+                store_session(&self.url, &session);
+                Ok(())
+            }
+            Err(e) => {
+                self.session = None;
+                Err(match e {
+                    CloudError::BadLogin => CloudError::Invalid("No se pudo guardar esa contraseña: probá con otra.".into()),
+                    other => other,
+                })
+            }
         }
     }
 
@@ -1145,6 +1238,54 @@ mod tests {
         assert_eq!(c.display_name(), Ok(None));
         fake.reply(200, r#"[{"display_name":"Ana"}]"#);
         assert_eq!(c.display_name(), Ok(Some("Ana".to_string())));
+        c.sign_out_without_keyring();
+    }
+
+    #[test]
+    fn a_forgotten_password_is_reset_with_the_code_from_the_mail() {
+        for ok in ["123456", " 12345678 ", "1234567890"] {
+            assert!(is_recovery_code(ok), "{ok:?}");
+        }
+        for bad in ["", "12345", "12345678901", "12a456", "123 456", "１２３４５６"] {
+            assert!(!is_recovery_code(bad), "{bad:?}");
+        }
+        let fake = Fake::default();
+        let mut c = client(&fake);
+        assert!(matches!(c.request_recovery("sin-arroba"), Err(CloudError::Invalid(_))));
+        assert!(fake.seen.lock().unwrap().is_empty());
+        fake.reply(200, "{}");
+        c.request_recovery(" a@b.co ").unwrap();
+        {
+            let seen = fake.seen.lock().unwrap();
+            assert_eq!(seen[0].path, "/auth/v1/recover");
+            assert_eq!(String::from_utf8_lossy(&seen[0].body), r#"{"email":"a@b.co"}"#);
+        }
+        // Datos que no valen no salen.
+        assert!(matches!(c.reset_password("a@b.co", "abc", "una-clave-larga"), Err(CloudError::Invalid(_))));
+        assert!(matches!(c.reset_password("a@b.co", "123456", "corta"), Err(CloudError::Invalid(_))));
+        assert_eq!(fake.seen.lock().unwrap().len(), 1);
+        // Código equivocado: error claro y sin sesión.
+        fake.reply(403, r#"{"error_code":"otp_expired","msg":"Token has expired or is invalid"}"#);
+        assert!(matches!(c.reset_password("a@b.co", "123456", "una-clave-larga"), Err(CloudError::Invalid(m)) if m.contains("código")));
+        assert_eq!(c.email(), None);
+        // Código bueno pero la contraseña nueva no se acepta: no queda ninguna sesión.
+        let session = format!(r#"{{"access_token":"tok","refresh_token":"ref","expires_in":3600,"user":{{"id":"{UUID_A}","email":"a@b.co"}}}}"#);
+        fake.reply(200, &session);
+        fake.reply(422, r#"{"error_code":"same_password"}"#);
+        assert!(matches!(c.reset_password("a@b.co", "123456", "una-clave-larga"), Err(CloudError::Invalid(_))));
+        assert_eq!(c.email(), None);
+        // Todo bien: verifica el código, cambia la contraseña con el token de esa sesión y queda adentro.
+        fake.reply(200, &session);
+        fake.reply(200, "{}");
+        c.reset_password("a@b.co", "123456", "una-clave-larga").unwrap();
+        assert_eq!(c.email(), Some("a@b.co"));
+        let seen = fake.seen.lock().unwrap().clone();
+        let last = seen.len() - 1;
+        assert_eq!(seen[last - 1].path, "/auth/v1/verify");
+        assert!(String::from_utf8_lossy(&seen[last - 1].body).contains(r#""type":"recovery""#));
+        assert_eq!(seen[last].path, "/auth/v1/user");
+        assert!(matches!(seen[last].method, Method::Put));
+        assert!(seen[last].headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer tok"));
         c.sign_out_without_keyring();
     }
 

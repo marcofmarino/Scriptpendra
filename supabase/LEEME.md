@@ -9,9 +9,14 @@
    dejar hecho desde el código ni desde `schema.sql`). Con eso activado, quien crea una cuenta recibe un mail y no puede iniciar
    sesión hasta abrirlo; el programa le avisa «Falta confirmar el mail». Mientras tanto, en el mismo lugar conviene poner la
    longitud mínima de contraseña en 10 (el programa ya la pide al crear la cuenta).
-5. Registrarte desde el programa y después, en el SQL Editor:
+5. **Authentication → Email Templates → Reset Password**: reemplazar el enlace del mensaje por el código, por ejemplo:
+   `<p>Tu código para recuperar la contraseña de Scriptpendra es:</p><h2>{{ .Token }}</h2>`
+   El programa no tiene página web a la que mande el enlace: la persona escribe el código en «Olvidé mi contraseña». El
+   código vence a la hora. (Con el servicio de mails por defecto del plan gratuito se mandan muy pocos por hora; si hace falta,
+   configurar un SMTP propio en **Project Settings → Auth → SMTP**.)
+6. Registrarte desde el programa y después, en el SQL Editor:
    `insert into public.admins (user_id) select id from auth.users where email = 'tu-mail@ejemplo.com';`
-6. **Project Settings → API Keys**: copiar la **Project URL** (algo como `https://xxxx.supabase.co`) y la clave pública: la
+7. **Project Settings → API Keys**: copiar la **Project URL** (algo como `https://xxxx.supabase.co`) y la clave pública: la
    **Publishable key** (empieza con `sb_publishable_`) o, en la pestaña de claves anteriores (*Legacy*), la **anon public**.
    El programa rechaza las claves secretas (`sb_secret_…` o `service_role`) para que no se peguen por error. Esas dos se las pasás a los grupos (se pegan en el
    programa: ☰ → Nube…). **La clave `service_role` es secreta: no se comparte ni se pega en el programa.**

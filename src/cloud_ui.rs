@@ -30,6 +30,10 @@ const PRESENCE_SECS: f64 = 8.0;
 enum Job {
     SignIn(String, String),
     SignUp(String, String),
+    /// Pide el código para recuperar la contraseña.
+    Recover(String),
+    /// Mail, código y contraseña nueva.
+    ResetPassword(String, String, String),
     SignOut,
     Groups,
     CreateGroup(String),
@@ -73,6 +77,7 @@ enum Event {
     SignedIn(String),
     SignedOut,
     NeedsConfirmation,
+    RecoverySent,
     Groups(Vec<(String, String, i64)>),
     Invite(String),
     Joined,
@@ -123,6 +128,14 @@ fn run(client: &mut Client<HttpsTransport>, job: Job) -> Event {
         Job::SignUp(email, password) => match client.sign_up(&email, &password) {
             Ok(SignUp::SignedIn) => Event::SignedIn(client.email().unwrap_or_default().to_string()),
             Ok(SignUp::NeedsConfirmation) => Event::NeedsConfirmation,
+            Err(e) => fail(e),
+        },
+        Job::Recover(email) => match client.request_recovery(&email) {
+            Ok(()) => Event::RecoverySent,
+            Err(e) => fail(e),
+        },
+        Job::ResetPassword(email, code, password) => match client.reset_password(&email, &code, &password) {
+            Ok(()) => Event::SignedIn(client.email().unwrap_or_default().to_string()),
             Err(e) => fail(e),
         },
         Job::SignOut => {
@@ -220,6 +233,10 @@ pub struct CloudUi {
     /// Entrar o crear cuenta (0 / 1) y si se ve la contraseña.
     login_mode: usize,
     show_password: bool,
+    /// Recuperar la contraseña: se está en esa pantalla, ya se mandó el mail, y el código que escribe la persona.
+    forgot: bool,
+    code_sent: bool,
+    code: String,
     /// El nombre que tiene la persona en el servidor, y lo que está escribiendo para elegirlo.
     cloud_name: Option<String>,
     name_loaded: bool,
@@ -293,6 +310,9 @@ impl CloudUi {
             self.busy = false;
             match event {
                 Event::SignedIn(email) => {
+                    self.forgot = false;
+                    self.code_sent = false;
+                    self.code.clear();
                     self.signed_as = Some(email);
                     self.password.clear();
                     self.note.clear();
@@ -317,6 +337,10 @@ impl CloudUi {
                     self.signed_as = None;
                     self.groups.clear();
                     self.projects.clear();
+                }
+                Event::RecoverySent => {
+                    self.code_sent = true;
+                    self.note = "Si el mail tiene cuenta, te mandamos un código. Puede tardar un minuto.".into();
                 }
                 Event::NeedsConfirmation => {
                     self.note = "Te mandamos un mail para confirmar la cuenta. Abrilo y después iniciá sesión.".into();
@@ -613,6 +637,10 @@ fn theme_icon() -> &'static str {
 
 /// Iniciar sesión o crear una cuenta.
 fn login_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, job: &mut Option<Job>) {
+    if this.forgot {
+        recovery_view(ui, p, this, busy, job);
+        return;
+    }
     ui.vertical_centered(|ui| {
         badge(ui, theme_icon(), theme::mix(p.container, p.accent, 0.25), 52.0, egui::FontId::proportional(26.0), p.accent);
         ui.add_space(tokens::SP_S);
@@ -641,6 +669,16 @@ fn login_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, jo
             this.show_password = !this.show_password;
         }
     });
+    if !signup {
+        ui.add_space(tokens::SP_XS);
+        if ui.link("Olvidé mi contraseña").clicked() {
+            this.forgot = true;
+            this.code_sent = false;
+            this.code.clear();
+            this.password.clear();
+            this.note.clear();
+        }
+    }
     ui.add_space(tokens::SP_M);
     let missing = if this.email.trim().is_empty() {
         Some("Falta el mail")
@@ -673,6 +711,76 @@ fn login_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, jo
     if signup {
         ui.add_space(tokens::SP_S);
         ui.label(RichText::new("Te vamos a mandar un mail para confirmar la cuenta.").size(tokens::FONT_SMALL).color(p.dim));
+    }
+}
+
+/// Recuperar la contraseña: primero el mail, después el código que llega y la contraseña nueva.
+fn recovery_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, job: &mut Option<Job>) {
+    ui.vertical_centered(|ui| {
+        badge(ui, crate::icon::LOCK_SIMPLE, theme::mix(p.container, p.accent, 0.25), 52.0, egui::FontId::proportional(26.0), p.accent);
+        ui.add_space(tokens::SP_S);
+        ui.label(RichText::new("Recuperar la contraseña").font(egui::FontId::new(tokens::FONT_TITLE, theme::bold_family())).color(p.text));
+        ui.label(RichText::new("Te mandamos un código por mail para elegir una nueva.").color(p.dim));
+    });
+    ui.add_space(tokens::SP_M);
+    labeled(ui, p, "Mail", |ui| {
+        ui.add_enabled(!this.code_sent, egui::TextEdit::singleline(&mut this.email).hint_text("nombre@ejemplo.com").desired_width(f32::INFINITY))
+    });
+    if !this.code_sent {
+        let missing = if !cloud::is_email_shape(&this.email) {
+            Some("Escribí tu mail")
+        } else if busy {
+            Some("Un momento…")
+        } else {
+            None
+        };
+        if kit::primary_button(ui, p, "Mandar el código", missing).clicked() && missing.is_none() {
+            *job = Some(Job::Recover(this.email.trim().to_string()));
+        }
+    } else {
+        labeled(ui, p, "Código del mail", |ui| {
+            ui.add(egui::TextEdit::singleline(&mut this.code).hint_text("123456").desired_width(f32::INFINITY))
+        });
+        ui.label(RichText::new("Contraseña nueva (10 caracteres o más)").size(tokens::FONT_SMALL).color(p.dim));
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let width = ui.available_width() - tokens::ICON_BTN - tokens::SP_S;
+            ui.add(egui::TextEdit::singleline(&mut this.password).password(!this.show_password).desired_width(width));
+            let eye = if this.show_password { crate::icon::EYE_SLASH } else { crate::icon::EYE };
+            if kit::icon_button(ui, p, eye, if this.show_password { "Ocultar la contraseña" } else { "Mostrar la contraseña" }, true).clicked() {
+                this.show_password = !this.show_password;
+            }
+        });
+        ui.add_space(tokens::SP_M);
+        let missing = if !cloud::is_recovery_code(&this.code) {
+            Some("Falta el código")
+        } else if this.password.chars().count() < 10 {
+            Some("La contraseña tiene que tener al menos 10 caracteres")
+        } else if busy {
+            Some("Un momento…")
+        } else {
+            None
+        };
+        if kit::primary_button(ui, p, "Cambiar la contraseña y entrar", missing).clicked() && missing.is_none() {
+            *job = Some(Job::ResetPassword(this.email.trim().to_string(), this.code.trim().to_string(), this.password.clone()));
+        }
+        if ui.link("Pedir otro código").clicked() {
+            this.code_sent = false;
+            this.code.clear();
+            this.note.clear();
+        }
+    }
+    if !this.note.is_empty() {
+        ui.add_space(tokens::SP_S);
+        message_line(ui, p, &this.note, !this.note.contains("mandamos un código"));
+    }
+    ui.add_space(tokens::SP_S);
+    if ui.link("Volver").clicked() {
+        this.forgot = false;
+        this.code_sent = false;
+        this.code.clear();
+        this.password.clear();
+        this.note.clear();
     }
 }
 
