@@ -171,13 +171,24 @@ pub fn pull<T: Transport>(
     link: &mut CloudLink,
     report: &mut Report,
 ) -> Result<(), SyncError> {
+    pull_with(client, file, link, report, false)
+}
+
+/// Igual que `pull`; con `full` no se fía del número del proyecto y compara versión por versión (se usa tras un conflicto).
+fn pull_with<T: Transport>(
+    client: &mut Client<T>,
+    file: &Path,
+    link: &mut CloudLink,
+    report: &mut Report,
+    full: bool,
+) -> Result<(), SyncError> {
     // El proyecto tiene que ser de esta misma nube: el archivo de enlace está en una carpeta que otros pueden tocar.
     if link.url != client.url() {
         return Err(CloudError::Invalid("El proyecto está unido a otra nube.".into()).into());
     }
     // Primero una pregunta mínima: si el número del proyecto es el que ya conocemos, no hay nada que traer y se evita bajar la lista.
     let known: i64 = link.versions.values().sum();
-    if !link.versions.is_empty() && client.project_stamp(&link.project)? == known {
+    if !full && !link.versions.is_empty() && client.project_stamp(&link.project)? == known {
         return Ok(());
     }
     let remote = client.section_versions(&link.project)?;
@@ -265,6 +276,10 @@ pub fn sync_once<T: Transport>(
     let mut report = Report::default();
     pull(client, file, link, &mut report)?;
     push(client, file, link, &mut report, who)?;
+    if report.retry {
+        // Alguien se adelantó y el número del proyecto no alcanzó para notarlo: se reconcilian las versiones una por una.
+        pull_with(client, file, link, &mut report, true)?;
+    }
     Ok(report)
 }
 

@@ -306,6 +306,8 @@ pub struct CloudUi {
     /// El grupo del que se pidió salir y falta confirmar.
     leave_confirm: Option<String>,
     last_sync: f64,
+    /// Reintentos seguidos por conflicto de versión.
+    retries: u32,
     /// Entrar o crear cuenta (0 / 1) y si se ve la contraseña.
     login_mode: usize,
     show_password: bool,
@@ -491,8 +493,12 @@ impl CloudUi {
                         out.message = Some("Alguien cambió lo mismo que vos: se guardó tu versión aparte en la carpeta del proyecto.".into());
                     }
                     // Si alguien se adelantó al subir, se vuelve a empezar enseguida.
-                    if report.retry {
+                    // Con un tope: si el conflicto no se resuelve, se sigue al ritmo normal en vez de insistir cada segundo.
+                    if report.retry && self.retries < 3 {
+                        self.retries += 1;
                         self.last_sync = 0.0;
+                    } else if !report.retry {
+                        self.retries = 0;
                     }
                     out.link = Some(new_link);
                 }
