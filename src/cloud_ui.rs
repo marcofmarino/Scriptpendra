@@ -23,6 +23,8 @@ use crate::{
 /// despacio si no, para no gastar tráfico de más.
 const SYNC_FAST_SECS: f64 = 2.0;
 const SYNC_SLOW_SECS: f64 = 15.0;
+/// Tope de la espera tras fallos seguidos.
+const SYNC_MAX_SECS: f64 = 120.0;
 
 /// Cada cuántos segundos se avisa dónde estoy (el servidor da por ido a quien lleva más de 30 sin avisar).
 const PRESENCE_SECS: f64 = 8.0;
@@ -308,6 +310,8 @@ pub struct CloudUi {
     last_sync: f64,
     /// Reintentos seguidos por conflicto de versión.
     retries: u32,
+    /// Sincronizaciones seguidas que fallaron (sin conexión o con error): cada una espera el doble que la anterior.
+    sync_errors: u32,
     /// Entrar o crear cuenta (0 / 1) y si se ve la contraseña.
     login_mode: usize,
     show_password: bool,
@@ -341,6 +345,19 @@ impl CloudUi {
     /// El mail de la cuenta con la sesión iniciada, si hay una.
     pub fn account(&self) -> Option<&str> {
         self.signed_as.as_deref()
+    }
+
+    /// Una sincronización terminó mal: si era la del proyecto abierto, la próxima espera más.
+    fn sync_failed(&mut self) {
+        if self.syncing {
+            self.sync_errors = (self.sync_errors + 1).min(8);
+        }
+    }
+
+    /// Cuánto se espera entre sincronizaciones: lo de siempre, el doble por cada fallo seguido, hasta `SYNC_MAX_SECS`.
+    fn sync_wait(&self, fast: bool) -> f64 {
+        let base = if fast { SYNC_FAST_SECS } else { SYNC_SLOW_SECS };
+        (base * f64::from(1u32 << self.sync_errors.min(6))).min(SYNC_MAX_SECS)
     }
 
     fn send(&mut self, job: Job) {
@@ -391,6 +408,7 @@ impl CloudUi {
             match event {
                 Event::SignedIn(email) => {
                     self.started_checked = true;
+                    self.sync_errors = 0;
                     self.forgot = false;
                     self.code_sent = false;
                     self.code.clear();
@@ -437,6 +455,7 @@ impl CloudUi {
                 Event::StillWaiting => self.wait_busy = false,
                 Event::NoSession => self.started_checked = true,
                 Event::Offline => {
+                    self.sync_failed();
                     self.syncing = false;
                     if !self.offline {
                         self.offline = true;
@@ -483,6 +502,7 @@ impl CloudUi {
                 }
                 Event::Synced(report, new_link) => {
                     self.syncing = false;
+                    self.sync_errors = 0;
                     if self.offline {
                         self.offline = false;
                         out.message = Some("Volvió la conexión: se sincronizó con la nube.".into());
@@ -518,6 +538,7 @@ impl CloudUi {
                     out.images = Some(result);
                 }
                 Event::Error(message) => {
+                    self.sync_failed();
                     self.syncing = false;
                     self.downloading = None;
                     self.wait_busy = false;
@@ -531,7 +552,7 @@ impl CloudUi {
         // La sincronización periódica del proyecto abierto.
         if let (Some(file), Some(link), Some(_)) = (file, link, &self.signed_as)
             && !self.syncing
-            && now - self.last_sync > if fast { SYNC_FAST_SECS } else { SYNC_SLOW_SECS }
+            && now - self.last_sync > self.sync_wait(fast)
         {
             self.last_sync = now;
             self.syncing = true;
@@ -652,7 +673,8 @@ impl CloudUi {
         let (Some(link), Some(_)) = (link, &self.signed_as) else {
             return;
         };
-        if self.presence_busy || now - self.last_presence < PRESENCE_SECS {
+        // Con la sincronización fallando no se insiste con la presencia.
+        if self.presence_busy || self.sync_errors > 0 || now - self.last_presence < PRESENCE_SECS {
             return;
         }
         self.last_presence = now;
@@ -1304,4 +1326,29 @@ fn group_card(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_syncs_wait_longer_each_time_up_to_a_cap_and_a_good_one_resets_it() {
+        let mut w = CloudUi::default();
+        assert_eq!(w.sync_wait(true), SYNC_FAST_SECS);
+        w.syncing = true;
+        w.sync_failed();
+        assert_eq!(w.sync_wait(true), SYNC_FAST_SECS * 2.0);
+        for _ in 0..20 {
+            w.syncing = true;
+            w.sync_failed();
+        }
+        assert_eq!(w.sync_wait(true), SYNC_MAX_SECS);
+        assert_eq!(w.sync_wait(false), SYNC_MAX_SECS);
+        // Un fallo de otra tarea mientras no se sincroniza no cuenta.
+        w.sync_errors = 0;
+        w.syncing = false;
+        w.sync_failed();
+        assert_eq!(w.sync_errors, 0);
+    }
 }
