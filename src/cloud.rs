@@ -838,6 +838,7 @@ impl<T: Transport> Client<T> {
     }
 
     /// Los proyectos de un grupo: (id, nombre).
+    #[allow(dead_code)] // la pantalla usa la lista de todos los grupos (`all_projects`)
     pub fn projects(&mut self, group: &str) -> Result<Vec<(String, String)>, CloudError> {
         Self::uuid_arg(group)?;
         let v = self.select(

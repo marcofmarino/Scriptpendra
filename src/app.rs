@@ -925,6 +925,9 @@ impl ScriptApp {
                 self.settings.save();
             }
         }
+        if out.links_changed {
+            self.cards = storage::recent_cards(&self.settings);
+        }
         if out.settings_changed {
             self.settings.save();
         }

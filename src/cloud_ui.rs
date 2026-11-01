@@ -51,7 +51,6 @@ enum Job {
     CreateGroup(String),
     Invite(String),
     Join(String),
-    Projects(String),
     Share { group: String, name: String, file: PathBuf, who: String },
     Open { group: String, project: String, file: PathBuf },
     Sync { file: PathBuf, link: CloudLink, who: String },
@@ -95,13 +94,14 @@ enum Event {
     AllProjects(Vec<(String, String, String)>),
     RecoverySent,
     Groups(Vec<(String, String, i64)>),
-    Invite(String),
+    /// Grupo y código.
+    Invite(String, String),
     Joined,
-    Projects(Vec<(String, String)>),
     Shared(CloudLink),
     Opened(PathBuf, CloudLink),
     Synced(Report, CloudLink),
-    Usage(i64, i64, i64),
+    /// Grupo, usado, cuota y cantidad de imágenes.
+    Usage(String, i64, i64, i64),
     Images(ImageResult),
     Peers(Vec<cloud::Peer>),
     /// El nombre que tiene la persona en el servidor (`None`: todavía no eligió).
@@ -178,12 +178,11 @@ fn run(client: &mut Client<HttpsTransport>, job: Job) -> Event {
             Ok(_) => client.groups().map(Event::Groups).unwrap_or_else(fail),
             Err(e) => fail(e),
         },
-        Job::Invite(group) => client.create_invite(&group).map(Event::Invite).unwrap_or_else(fail),
+        Job::Invite(group) => client.create_invite(&group).map(|code| Event::Invite(group.clone(), code)).unwrap_or_else(fail),
         Job::Join(code) => match client.join_group(&code) {
             Ok(_) => Event::Joined,
             Err(e) => fail(e),
         },
-        Job::Projects(group) => client.projects(&group).map(Event::Projects).unwrap_or_else(fail),
         Job::Share { group, name, file, who } => cloudsync::share_project(client, &group, &name, &file, &who)
             .map(Event::Shared)
             .unwrap_or_else(fail_sync),
@@ -204,7 +203,7 @@ fn run(client: &mut Client<HttpsTransport>, job: Job) -> Event {
         }
         Job::Usage(group) => client
             .group_usage(&group)
-            .map(|(used, quota, count)| Event::Usage(used, quota, count))
+            .map(|(used, quota, count)| Event::Usage(group.clone(), used, quota, count))
             .unwrap_or_else(fail),
     }
 }
@@ -241,6 +240,14 @@ pub struct Out {
     pub images: Option<ImageResult>,
     /// Se pidió sacar de la nube las imágenes que ya no se usan.
     pub clean_images: bool,
+    /// Cambió qué proyectos de esta computadora están unidos a la nube (hay que volver a leer las tarjetas del inicio).
+    pub links_changed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupForm {
+    Create,
+    Join,
 }
 
 #[derive(Default)]
@@ -254,13 +261,17 @@ pub struct CloudUi {
     password: String,
     signed_as: Option<String>,
     groups: Vec<(String, String, i64)>,
-    selected_group: Option<usize>,
-    projects: Vec<(String, String)>,
-    usage: Option<(i64, i64, i64)>,
+    /// Cuánto ocupan las imágenes de cada grupo: (usado, cuota, cantidad).
+    usage: std::collections::HashMap<String, (i64, i64, i64)>,
+    /// Qué formulario está abierto arriba: crear grupo o unirse con un código.
+    form: Option<GroupForm>,
+    /// Proyectos de esta computadora unidos a la nube: (archivo, id en la nube). Se vuelve a leer cada tanto.
+    linked: Vec<(PathBuf, String)>,
+    linked_at: f64,
     new_group: String,
     join_code: String,
-    share_name: String,
-    invite: Option<String>,
+    /// El último código de invitación creado: (grupo, código).
+    invite: Option<(String, String)>,
     note: String,
     busy: bool,
     syncing: bool,
@@ -390,8 +401,8 @@ impl CloudUi {
                     self.name_loaded = false;
                     self.signed_as = None;
                     self.groups.clear();
-                    self.projects.clear();
                     self.catalog.clear();
+                    self.usage.clear();
                 }
                 Event::RecoverySent => {
                     self.code_sent = true;
@@ -406,9 +417,7 @@ impl CloudUi {
                 Event::StillWaiting => self.wait_busy = false,
                 Event::Left(group) => {
                     self.leave_confirm = None;
-                    self.selected_group = None;
                     self.invite = None;
-                    self.projects.clear();
                     self.note.clear();
                     if link.is_some_and(|l| l.group == group) {
                         out.unlink = true;
@@ -423,17 +432,16 @@ impl CloudUi {
                 Event::Groups(groups) => {
                     self.groups = groups;
                     self.request_catalog();
-                    if self.selected_group.is_none_or(|i| i >= self.groups.len()) {
-                        self.selected_group = (!self.groups.is_empty()).then_some(0);
+                    self.usage.retain(|id, _| self.groups.iter().any(|g| &g.0 == id));
+                    for id in self.groups.iter().map(|g| g.0.clone()).collect::<Vec<_>>() {
+                        self.send(Job::Usage(id));
                     }
-                    self.refresh_group();
                 }
-                Event::Invite(code) => self.invite = Some(code),
+                Event::Invite(group, code) => self.invite = Some((group, code)),
                 Event::Joined => {
                     self.join_code.clear();
                     self.send(Job::Groups);
                 }
-                Event::Projects(list) => self.projects = list,
                 Event::Shared(new_link) => {
                     self.request_catalog();
                     out.message = Some("Proyecto compartido en la nube.".into());
@@ -461,11 +469,13 @@ impl CloudUi {
                     self.presence_busy = false;
                     out.peers = Some(peers);
                 }
-                Event::Usage(used, quota, count) => self.usage = Some((used, quota, count)),
+                Event::Usage(group, used, quota, count) => {
+                    self.usage.insert(group, (used, quota, count));
+                }
                 Event::Images(result) => {
                     self.images_busy = false;
                     // El uso del grupo cambió.
-                    if let Some(group) = self.selected_group.and_then(|i| self.groups.get(i)).map(|g| g.0.clone()) {
+                    if let Some(group) = link.map(|l| l.group.clone()) {
                         self.send(Job::Usage(group));
                     }
                     out.images = Some(result);
@@ -602,16 +612,6 @@ impl CloudUi {
         }
     }
 
-    fn refresh_group(&mut self) {
-        self.projects.clear();
-        self.usage = None;
-        self.invite = None;
-        if let Some(group) = self.selected_group.and_then(|i| self.groups.get(i)).map(|g| g.0.clone()) {
-            self.send(Job::Projects(group.clone()));
-            self.send(Job::Usage(group));
-        }
-    }
-
     /// La ventana de la cuenta. `file` y `title` son los del proyecto abierto (si está guardado en un archivo).
     pub fn dialog(
         &mut self,
@@ -634,13 +634,23 @@ impl CloudUi {
         let built_in = cloud::has_built_in();
         let signed = self.signed_as.clone();
         let busy = self.busy;
-        let mut chosen_group: Option<usize> = None;
-        let mut open_dest: Option<(String, String)> = None;
+        let mut acts = Acts { unlink: None, clean: false, open_dest: None };
         let mut sign_out = false;
-        let mut unlink = false;
-        let mut clean = false;
         let mut save_config = false;
         let author = settings.author();
+        // Qué proyectos de esta computadora están unidos a la nube (se leen del disco cada tanto, no en cada cuadro).
+        let now = ctx.input(|i| i.time);
+        if now - self.linked_at > 2.0 {
+            self.linked_at = now;
+            let mut paths = settings.recents.clone();
+            if let Some(f) = file
+                && !paths.iter().any(|x| x == f)
+            {
+                paths.push(f.to_path_buf());
+            }
+            self.linked = paths.into_iter().filter_map(|x| CloudLink::load(&x).map(|l| (x, l.project))).collect();
+        }
+        let linked = self.linked.clone();
         let (mut config_url, mut config_key) = (self.config_url.clone(), self.config_key.clone());
         if config_url.is_empty() && config_key.is_empty() {
             config_url = settings.cloud_url.clone();
@@ -675,14 +685,8 @@ impl CloudUi {
                     }
                     return;
                 }
-                groups_view(ui, p, this, busy, &mut job, &mut chosen_group);
-                let Some((group_id, group_name, _)) = this.selected_group.and_then(|i| this.groups.get(i)).cloned() else {
-                    return;
-                };
-                group_view(
-                    ui, p, this, busy, &group_id, &group_name, file, title, link, unused_images, &author,
-                    &mut job, &mut unlink, &mut clean, &mut open_dest,
-                );
+                let view = View { file, title, link, unused_images, author: &author, linked: &linked };
+                groups_page(ui, p, this, busy, &view, &mut job, &mut acts);
             },
             |ui| {
                 if ui.button("Cerrar").clicked() {
@@ -698,19 +702,23 @@ impl CloudUi {
             self.config_key.clear();
             out.settings_changed = true;
         }
-        if let Some(i) = chosen_group {
-            self.leave_confirm = None;
-            self.selected_group = Some(i);
-            self.refresh_group();
-        }
-        if let Some((project, name)) = open_dest {
+        if let Some((group, project, name)) = acts.open_dest {
             // La copia va a una carpeta nueva que elige la persona.
             if let Some(chosen) = rfd::FileDialog::new().set_file_name(format!("{name}.{}", crate::storage::EXTENSION)).save_file() {
                 let dest = crate::assets::project_file_for(&chosen);
-                if let Some(group) = self.selected_group.and_then(|i| self.groups.get(i)).map(|g| g.0.clone()) {
-                    job = Some(Job::Open { group, project, file: dest });
-                }
+                self.downloading = Some(project.clone());
+                job = Some(Job::Open { group, project, file: dest });
             }
+        }
+        if let Some(path) = acts.unlink {
+            // Dejar de sincronizar no borra nada: solo se quita el enlace de la carpeta.
+            if Some(path.as_path()) == file {
+                out.unlink = true;
+            } else {
+                CloudLink::remove(&path);
+            }
+            out.links_changed = true;
+            self.linked_at = f64::NEG_INFINITY;
         }
         if sign_out {
             job = Some(Job::SignOut);
@@ -718,8 +726,7 @@ impl CloudUi {
         if let Some(job) = job {
             self.send(job);
         }
-        out.unlink = unlink;
-        out.clean_images = clean;
+        out.clean_images = acts.clean;
         if close || closed {
             self.open = false;
         }
@@ -1036,87 +1043,131 @@ fn account_header(ui: &mut egui::Ui, p: &Palette, email: &str, name: Option<&str
     });
 }
 
-/// Los grupos de la persona, para elegir uno, y crear uno o entrar con un código.
-fn groups_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, job: &mut Option<Job>, chosen: &mut Option<usize>) {
-    kit::section(ui, p, "Grupos", None);
-    if this.groups.is_empty() {
-        ui.label(RichText::new("Todavía no estás en ningún grupo. Creá uno o entrá con un código.").color(p.dim));
-    }
-    ui.horizontal_wrapped(|ui| {
-        for (i, (_, name, _)) in this.groups.iter().enumerate() {
-            let on = this.selected_group == Some(i);
-            let text = RichText::new(name).color(if on { p.on_accent } else { p.text });
-            let button = egui::Button::new(text).fill(if on { p.accent } else { p.container });
-            if ui.add(button).clicked() {
-                *chosen = Some(i);
+/// Lo que la persona pidió hacer en la lista de grupos (se atiende después de dibujar).
+struct Acts {
+    /// Archivo de un proyecto que deja de sincronizarse.
+    unlink: Option<PathBuf>,
+    clean: bool,
+    /// Bajar una copia: (grupo, proyecto, nombre).
+    open_dest: Option<(String, String, String)>,
+}
+
+/// Lo que la lista de grupos necesita saber del proyecto abierto y de la computadora.
+struct View<'a> {
+    file: Option<&'a Path>,
+    title: &'a str,
+    link: Option<&'a CloudLink>,
+    unused_images: usize,
+    author: &'a str,
+    linked: &'a [(PathBuf, String)],
+}
+
+/// La pantalla de grupos, al estilo de un aula: arriba crear un grupo o unirse con un código, y debajo una tarjeta por cada grupo.
+fn groups_page(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, view: &View, job: &mut Option<Job>, acts: &mut Acts) {
+    kit::section(ui, p, "Tus grupos", None);
+    ui.horizontal(|ui| {
+        for (form, icon, label) in [
+            (GroupForm::Create, crate::icon::PLUS, "Crear un grupo"),
+            (GroupForm::Join, crate::icon::USERS_THREE, "Unirse con un código"),
+        ] {
+            let on = this.form == Some(form);
+            let text = RichText::new(format!("{icon}  {label}")).color(if on { p.on_accent } else { p.text });
+            if ui.add(egui::Button::new(text).fill(if on { p.accent } else { p.container })).clicked() {
+                this.form = if on { None } else { Some(form) };
             }
         }
     });
-    ui.add_space(tokens::SP_S);
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut this.new_group).hint_text("Nombre del grupo nuevo").desired_width(ui.available_width() - 110.0));
-        if ui.add_enabled(!busy && !this.new_group.trim().is_empty(), egui::Button::new(format!("{}  Crear", crate::icon::PLUS))).clicked() {
-            *job = Some(Job::CreateGroup(this.new_group.trim().to_string()));
-            this.new_group.clear();
-        }
-    });
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut this.join_code).hint_text("Código de invitación").desired_width(ui.available_width() - 110.0));
-        if ui.add_enabled(!busy && !this.join_code.trim().is_empty(), egui::Button::new("Entrar")).clicked() {
-            *job = Some(Job::Join(this.join_code.trim().to_string()));
-        }
-    });
+    if let Some(form) = this.form {
+        ui.add_space(tokens::SP_S);
+        kit::card(ui, p, |ui| {
+            ui.set_width(ui.available_width());
+            match form {
+                GroupForm::Create => {
+                    ui.label(RichText::new("Nombre del grupo nuevo").size(tokens::FONT_SMALL).color(p.dim));
+                    let resp = ui.add(egui::TextEdit::singleline(&mut this.new_group).hint_text("Por ejemplo, Corto de la facultad").desired_width(f32::INFINITY));
+                    let ready = !busy && !this.new_group.trim().is_empty();
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.add_space(tokens::SP_XS);
+                    if (ui.add_enabled(ready, egui::Button::new(format!("{}  Crear", crate::icon::PLUS))).clicked() || (enter && ready)) && ready {
+                        *job = Some(Job::CreateGroup(this.new_group.trim().to_string()));
+                        this.new_group.clear();
+                        this.form = None;
+                    }
+                }
+                GroupForm::Join => {
+                    ui.label(RichText::new("Código de invitación").size(tokens::FONT_SMALL).color(p.dim));
+                    let resp = ui.add(egui::TextEdit::singleline(&mut this.join_code).hint_text("Pegá el código que te pasaron").desired_width(f32::INFINITY));
+                    let ready = !busy && !this.join_code.trim().is_empty();
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.add_space(tokens::SP_XS);
+                    if (ui.add_enabled(ready, egui::Button::new("Unirme")).clicked() || (enter && ready)) && ready {
+                        *job = Some(Job::Join(this.join_code.trim().to_string()));
+                        this.form = None;
+                    }
+                }
+            }
+        });
+    }
+    ui.add_space(tokens::SP_M);
+    if this.groups.is_empty() {
+        ui.label(RichText::new("Todavía no estás en ningún grupo. Creá uno o unite con un código.").color(p.dim));
+        return;
+    }
+    let groups = this.groups.clone();
+    for (id, name, _) in &groups {
+        group_card(ui, p, this, busy, view, job, acts, id, name);
+        ui.add_space(tokens::SP_M);
+    }
 }
 
-/// El grupo elegido: su espacio de imágenes, invitaciones, el proyecto abierto y los proyectos compartidos.
+/// Un grupo: su nombre, invitar y salir, el espacio de imágenes y sus proyectos.
 #[allow(clippy::too_many_arguments)]
-fn group_view(
+fn group_card(
     ui: &mut egui::Ui,
     p: &Palette,
     this: &mut CloudUi,
     busy: bool,
+    view: &View,
+    job: &mut Option<Job>,
+    acts: &mut Acts,
     group_id: &str,
     group_name: &str,
-    file: Option<&Path>,
-    title: &str,
-    link: Option<&CloudLink>,
-    unused_images: usize,
-    author: &str,
-    job: &mut Option<Job>,
-    unlink: &mut bool,
-    clean: &mut bool,
-    open_dest: &mut Option<(String, String)>,
 ) {
-    kit::section(ui, p, &format!("Grupo «{group_name}»"), None);
     kit::card(ui, p, |ui| {
         ui.set_width(ui.available_width());
-        if let Some((used, quota, count)) = this.usage {
-            let fraction = if quota > 0 { (used as f32 / quota as f32).clamp(0.0, 1.0) } else { 1.0 };
-            ui.label(RichText::new(format!("Imágenes: {} de {} ({} en total)", megabytes(used), megabytes(quota), count)).size(tokens::FONT_SMALL).color(p.dim));
-            ui.add(egui::ProgressBar::new(fraction).fill(if fraction > 0.9 { p.warning } else { p.accent }));
-            if fraction > 0.8 {
-                ui.label(RichText::new("El espacio para imágenes está casi lleno: conviene quitar las que no se usan.").size(tokens::FONT_SMALL).color(p.warning));
-            }
-            ui.add_space(tokens::SP_S);
-        }
-        if unused_images > 0 {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{unused_images} imágenes de este proyecto ya no se usan.")).size(tokens::FONT_SMALL));
-                if ui.button("Quitarlas de la nube").clicked() {
-                    *clean = true;
+        kit::sides(
+            ui,
+            |ui| {
+                let color = theme::character_color(group_name);
+                let initial = group_name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                badge(ui, &initial, color, 36.0, egui::FontId::new(16.0, theme::bold_family()), theme::ink_on(color, p));
+                ui.add(egui::Label::new(RichText::new(group_name).font(egui::FontId::new(tokens::FONT_CARD_TITLE, theme::bold_family())).color(p.text)).truncate());
+            },
+            |ui| {
+                if kit::icon_button(ui, p, crate::icon::SIGN_OUT, "Salir del grupo", !busy).clicked() {
+                    this.leave_confirm = Some(group_id.to_string());
                 }
-            });
-        }
-        if ui.add_enabled(!busy, egui::Button::new(format!("{}  Código de invitación", crate::icon::LINK_SIMPLE))).clicked() {
-            *job = Some(Job::Invite(group_id.to_string()));
-        }
-        if let Some(code) = &this.invite {
+                if kit::icon_button(ui, p, crate::icon::LINK_SIMPLE, "Invitar a alguien: crea un código de invitación", !busy).clicked() {
+                    *job = Some(Job::Invite(group_id.to_string()));
+                }
+            },
+        );
+        // El código de invitación recién creado.
+        if let Some((_, code)) = this.invite.as_ref().filter(|(g, _)| g == group_id) {
+            ui.add_space(tokens::SP_S);
             ui.label(RichText::new("Pasale este código a quien quieras sumar. Vale 7 días y se muestra una sola vez:").size(tokens::FONT_SMALL).color(p.dim));
             let mut shown = code.clone();
             ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
+            ui.add_space(tokens::SP_XS);
+            if ui.button(format!("{}  Copiar la invitación", crate::icon::COPY)).clicked() {
+                ui.ctx().copy_text(format!(
+                    "Te invito al grupo «{group_name}» en Scriptpendra. En el programa: Nube → Unirse con un código, y pegá este código: {code}"
+                ));
+            }
         }
-        ui.add_space(tokens::SP_S);
+        // Salir, con confirmación.
         if this.leave_confirm.as_deref() == Some(group_id) {
+            ui.add_space(tokens::SP_S);
             message_line(
                 ui,
                 p,
@@ -1132,54 +1183,67 @@ fn group_view(
                     this.leave_confirm = None;
                 }
             });
-        } else if ui.add_enabled(!busy, egui::Button::new(format!("{}  Salir del grupo", crate::icon::SIGN_OUT))).clicked() {
-            this.leave_confirm = Some(group_id.to_string());
+        }
+        // El espacio de imágenes.
+        if let Some((used, quota, count)) = this.usage.get(group_id).copied() {
+            ui.add_space(tokens::SP_S);
+            let fraction = if quota > 0 { (used as f32 / quota as f32).clamp(0.0, 1.0) } else { 1.0 };
+            ui.label(RichText::new(format!("Imágenes: {} de {} ({} en total)", megabytes(used), megabytes(quota), count)).size(tokens::FONT_SMALL).color(p.dim));
+            ui.add(egui::ProgressBar::new(fraction).fill(if fraction > 0.9 { p.warning } else { p.accent }));
+            if fraction > 0.8 {
+                ui.label(RichText::new("El espacio para imágenes está casi lleno: conviene quitar las que no se usan.").size(tokens::FONT_SMALL).color(p.warning));
+            }
+        }
+        if view.unused_images > 0 && view.link.is_some_and(|l| l.group == group_id) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} imágenes de este proyecto ya no se usan.", view.unused_images)).size(tokens::FONT_SMALL));
+                if ui.button("Quitarlas de la nube").clicked() {
+                    acts.clean = true;
+                }
+            });
+        }
+        // Los proyectos.
+        ui.add_space(tokens::SP_S);
+        ui.label(RichText::new("Proyectos").size(tokens::FONT_SMALL).color(p.dim));
+        let projects: Vec<(String, String)> = this.catalog.iter().filter(|c| c.2 == group_id).map(|c| (c.0.clone(), c.1.clone())).collect();
+        if projects.is_empty() {
+            ui.label(RichText::new("Todavía no hay proyectos compartidos en este grupo.").color(p.dim));
+        }
+        for (id, name) in &projects {
+            let local = view.linked.iter().find(|(_, project)| project == id).map(|(path, _)| path.clone());
+            ui.add_space(tokens::SP_XS);
+            kit::sides(
+                ui,
+                |ui| {
+                    let (icon, color) = if local.is_some() { (crate::icon::GLOBE, p.success) } else { (crate::icon::CLOUD, p.dim) };
+                    ui.label(RichText::new(icon).color(color));
+                    ui.add(egui::Label::new(RichText::new(name).color(p.text)).truncate());
+                },
+                |ui| match &local {
+                    Some(path) => {
+                        if ui.button("Dejar de sincronizar").on_hover_text("La copia de esta computadora queda como está; solo deja de sincronizarse").clicked() {
+                            acts.unlink = Some(path.clone());
+                        }
+                    }
+                    None => {
+                        if ui.add_enabled(!busy, egui::Button::new(format!("{}  Bajar una copia", crate::icon::DOWNLOAD_SIMPLE))).clicked() {
+                            acts.open_dest = Some((group_id.to_string(), id.clone(), name.clone()));
+                        }
+                    }
+                },
+            );
+        }
+        // El proyecto abierto, si todavía no está en ningún grupo.
+        if let (Some(f), None, false) = (view.file, view.link, view.title.is_empty()) {
+            ui.add_space(tokens::SP_S);
+            if ui.add_enabled(!busy, egui::Button::new(format!("{}  Compartir «{}» en este grupo", crate::icon::PLUS, view.title))).clicked() {
+                *job = Some(Job::Share {
+                    group: group_id.to_string(),
+                    name: view.title.to_string(),
+                    file: f.to_path_buf(),
+                    who: view.author.to_string(),
+                });
+            }
         }
     });
-    // El proyecto abierto (desde la pantalla de inicio no hay ninguno).
-    if !title.is_empty() {
-        kit::section(ui, p, "Este proyecto", None);
-        kit::card(ui, p, |ui| {
-            ui.set_width(ui.available_width());
-            match (file, link) {
-                (Some(_), Some(l)) if l.group == group_id => {
-                    ui.label(RichText::new(format!("{}  Se sincroniza solo con la nube.", crate::icon::CHECK_CIRCLE)).color(p.success));
-                    if ui.button("Dejar de sincronizar").clicked() {
-                        *unlink = true;
-                    }
-                }
-                (Some(_), Some(_)) => {
-                    ui.label(RichText::new("Este proyecto está unido a otro grupo.").color(p.dim));
-                }
-                (Some(f), None) => {
-                    ui.add(egui::TextEdit::singleline(&mut this.share_name).hint_text(title).desired_width(f32::INFINITY));
-                    ui.add_space(tokens::SP_XS);
-                    if ui.add_enabled(!busy, egui::Button::new("Compartir este proyecto en el grupo")).clicked() {
-                        let name = if this.share_name.trim().is_empty() { title.to_string() } else { this.share_name.trim().to_string() };
-                        *job = Some(Job::Share { group: group_id.to_string(), name, file: f.to_path_buf(), who: author.to_string() });
-                    }
-                }
-                (None, _) => {
-                    ui.label(RichText::new("Guardá el proyecto en un archivo para poder compartirlo.").color(p.dim));
-                }
-            }
-        });
-    }
-    kit::section(ui, p, "Proyectos del grupo", None);
-    if this.projects.is_empty() {
-        ui.label(RichText::new("Todavía no hay proyectos compartidos en este grupo.").color(p.dim));
-    }
-    for (id, name) in &this.projects {
-        kit::card(ui, p, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(name).color(p.text));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(!busy, egui::Button::new("Abrir una copia")).clicked() {
-                        *open_dest = Some((id.clone(), name.clone()));
-                    }
-                });
-            });
-        });
-    }
 }
