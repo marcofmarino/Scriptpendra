@@ -2962,6 +2962,8 @@ pub enum HomeAction {
     Create,
     Open,
     OpenRecent(std::path::PathBuf),
+    /// Bajar a esta computadora un proyecto de un grupo (su id en la nube).
+    Download(String),
     Settings,
     /// La cuenta y la nube (iniciar sesión, grupos, proyectos compartidos).
     Cloud,
@@ -3055,7 +3057,7 @@ fn story_card(ui: &mut Ui, p: &Palette, card: &RecentCard) -> egui::Response {
     let pad = 16.0;
     let text_w = CARD_W - COVER_W - 2.0 * pad;
     let mut y = rect.top() + pad;
-    let bottom = rect.bottom() - 34.0;
+    let bottom = rect.bottom() - if card.cloud.is_some() { 54.0 } else { 34.0 };
     if let Some(g) = fitted_text(
         ui,
         &card.title,
@@ -3087,14 +3089,90 @@ fn story_card(ui: &mut Ui, p: &Palette, card: &RecentCard) -> egui::Response {
         FontId::proportional(12.0),
         p.dim,
     );
+    let corner = egui::pos2(rect.right() - 22.0, rect.bottom() - 14.0);
+    match &card.cloud {
+        Some(cloud) => {
+            group_line(ui, p, egui::pos2(cover.right() + pad, rect.bottom() - 34.0), &cloud.group, text_w);
+            cloud_globe(ui, p, corner, cloud.syncing);
+            let tip = if cloud.syncing { "Sincronizando con la nube" } else { "Sincronizado con la nube" };
+            return resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+        None => {
+            ui.painter().text(corner + vec2(8.0, 0.0), Align2::RIGHT_CENTER, icon::LAPTOP, FontId::proportional(17.0), p.dim);
+        }
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Un proyecto de un grupo que todavía no está en esta computadora.
+pub struct RemoteCard {
+    pub project: String,
+    pub name: String,
+    pub group: String,
+    /// Se está bajando ahora.
+    pub downloading: bool,
+}
+
+/// El grupo al que pertenece el proyecto: su icono y nombre, en una línea.
+fn group_line(ui: &Ui, p: &Palette, pos: egui::Pos2, group: &str, width: f32) {
+    let name = if group.is_empty() { "Grupo" } else { group };
+    let font = FontId::proportional(12.0);
+    let icon_w = 18.0;
+    ui.painter().text(pos, Align2::LEFT_CENTER, icon::USERS_THREE, FontId::proportional(14.0), p.accent);
+    if let Some(g) = fitted_text(ui, name, font, p.accent, (width - icon_w - 24.0).max(10.0), 16.0) {
+        let h = g.size().y;
+        ui.painter().galley(pos + vec2(icon_w, -h / 2.0), g, p.accent);
+    }
+}
+
+/// La Tierra de la nube: verde si está sincronizado y amarilla, girando, mientras sincroniza.
+fn cloud_globe(ui: &Ui, p: &Palette, center: egui::Pos2, syncing: bool) {
+    let color = if syncing { p.warning } else { p.success };
+    let galley = ui.painter().layout_no_wrap(icon::GLOBE.to_string(), FontId::proportional(20.0), color);
+    let angle = if syncing {
+        ui.ctx().request_repaint();
+        (ui.input(|i| i.time) as f32 * std::f32::consts::TAU * 0.8) % std::f32::consts::TAU
+    } else {
+        0.0
+    };
+    ui.painter().add(egui::epaint::TextShape::new(center, galley, color).with_angle_and_anchor(angle, Align2::CENTER_CENTER));
+}
+
+/// Un proyecto de grupo que se puede bajar: en lugar de la portada, el icono de descarga.
+fn remote_card(ui: &mut Ui, p: &Palette, card: &RemoteCard) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(CARD_W, CARD_H), Sense::click());
+    let hover = resp.hovered();
+    ui.painter().rect(
+        rect,
+        6,
+        p.container,
+        Stroke::new(1.0, if hover { p.primary } else { theme::mix(p.container, p.border, 0.6) }),
+        egui::StrokeKind::Inside,
+    );
+    let cover = egui::Rect::from_min_size(rect.min, vec2(COVER_W, CARD_H));
+    let radius = egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 };
+    ui.painter().rect_filled(cover, radius, theme::mix(p.container, p.accent, if hover { 0.28 } else { 0.16 }));
+    if card.downloading {
+        cloud_globe(ui, p, cover.center(), true);
+    } else {
+        ui.painter().text(cover.center(), Align2::CENTER_CENTER, icon::DOWNLOAD_SIMPLE, FontId::proportional(44.0), p.accent);
+    }
+    let pad = 16.0;
+    let text_w = CARD_W - COVER_W - 2.0 * pad;
+    let x = cover.right() + pad;
+    if let Some(g) = fitted_text(ui, &card.name, FontId::new(18.0, bold_family()), p.text, text_w, 46.0) {
+        ui.painter().galley(egui::pos2(x, rect.top() + pad), g, p.text);
+    }
+    group_line(ui, p, egui::pos2(x, rect.bottom() - 34.0), &card.group, text_w);
     ui.painter().text(
-        egui::pos2(rect.right() - 14.0, rect.bottom() - 14.0),
-        Align2::RIGHT_CENTER,
-        icon::LAPTOP,
-        FontId::proportional(17.0),
+        egui::pos2(x, rect.bottom() - 14.0),
+        Align2::LEFT_CENTER,
+        if card.downloading { "Bajando…" } else { "Hacé clic para bajarlo" },
+        FontId::proportional(12.0),
         p.dim,
     );
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    resp.on_hover_text("Está en la nube y todavía no en esta computadora")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Tarjeta de acción («Crear historia», «Abrir historia») con el mismo tamaño que las de historia.
@@ -3138,7 +3216,7 @@ fn action_card(ui: &mut Ui, p: &Palette, code: &str, label: &str) -> egui::Respo
 
 /// Pantalla de inicio: una grilla con «Crear historia», «Abrir historia» y las historias recientes.
 /// La pantalla de inicio. `account` es lo que dice el botón de la cuenta: «Iniciar sesión» o el nombre de quien entró.
-pub fn home(ui: &mut Ui, cards: &[RecentCard], p: &Palette, account: &str) -> Option<HomeAction> {
+pub fn home(ui: &mut Ui, cards: &[RecentCard], remote: &[RemoteCard], p: &Palette, account: &str) -> Option<HomeAction> {
     let mut action = None;
     // Arriba, el nombre de la app y el engranaje de Ajustes contra el borde derecho.
     crate::ui::kit::sides(
@@ -3178,7 +3256,7 @@ pub fn home(ui: &mut Ui, cards: &[RecentCard], p: &Palette, account: &str) -> Op
                 ui.add_space(side);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing = vec2(gap, gap);
-                    let total = cards.len() + 2;
+                    let total = cards.len() + remote.len() + 2;
                     for row in 0..total.div_ceil(cols) {
                         ui.horizontal(|ui| {
                             for col in 0..cols {
@@ -3200,10 +3278,16 @@ pub fn home(ui: &mut Ui, cards: &[RecentCard], p: &Palette, account: &str) -> Op
                                             action = Some(HomeAction::Open);
                                         }
                                     }
-                                    _ => {
+                                    _ if n - 2 < cards.len() => {
                                         let c = &cards[n - 2];
                                         if story_card(ui, p, c).clicked() {
                                             action = Some(HomeAction::OpenRecent(c.path.clone()));
+                                        }
+                                    }
+                                    _ => {
+                                        let c = &remote[n - 2 - cards.len()];
+                                        if remote_card(ui, p, c).clicked() && !c.downloading {
+                                            action = Some(HomeAction::Download(c.project.clone()));
                                         }
                                     }
                                 }

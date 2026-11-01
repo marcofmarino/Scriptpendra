@@ -1255,6 +1255,8 @@ impl Screen for DocumentScreen<'_> {
 /// Inicio · tipo F, sin el marco del proyecto.
 pub struct HomeScreen<'a> {
     pub cards: &'a [crate::storage::RecentCard],
+    /// Proyectos de los grupos que se pueden bajar.
+    pub remote: &'a [pages::RemoteCard],
     pub action: &'a mut Option<pages::HomeAction>,
     /// Lo que dice el botón de la cuenta.
     pub account: &'a str,
@@ -1268,7 +1270,7 @@ impl Screen for HomeScreen<'_> {
         "Inicio".into()
     }
     fn content(&mut self, ui: &mut Ui, cx: &mut ScreenCx) {
-        *self.action = pages::home(ui, self.cards, cx.palette, self.account);
+        *self.action = pages::home(ui, self.cards, self.remote, cx.palette, self.account);
     }
 }
 

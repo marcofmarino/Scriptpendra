@@ -2629,6 +2629,7 @@ impl ScriptApp {
                 panel_id: "no_inspector",
                 panel_default: 0.0,
                 page_key: &key,
+                peers: &[],
             };
             shell::show_screen(ui, &mut screen, &mut cx, flags);
         }
@@ -2776,23 +2777,7 @@ impl ScriptApp {
         } else {
             "Sin guardar"
         };
-        let mut info = self.page_info(page);
-        // Quién más está en el proyecto compartido.
-        if self.cloud_link.is_some() && !self.peers.is_empty() {
-            let people: Vec<String> = self
-                .peers
-                .iter()
-                .map(|p| {
-                    let name = if p.who.is_empty() { "Alguien" } else { p.who.as_str() };
-                    match (p.screen.is_empty(), p.detail.is_empty()) {
-                        (true, _) => name.to_string(),
-                        (false, true) => format!("{name} ({})", p.screen),
-                        (false, false) => format!("{name} ({} · {})", p.screen, p.detail),
-                    }
-                })
-                .collect();
-            info = format!("En línea: {}  ·  {info}", people.join(", "));
-        }
+        let info = self.page_info(page);
         let message = self.last_message.clone();
         // Los botones de la barra lateral y del inspector viven en la barra de estado (interfaz.md §1.5).
         let has_inspector = !self.show_settings && Self::inspector_id(page).is_some();
@@ -2941,8 +2926,9 @@ impl ScriptApp {
             panel_id,
             panel_default,
             page_key: &key,
+            peers: if self.cloud_link.is_some() { &self.peers } else { &[] },
         };
-        let out = match page {
+        let mut out = match page {
             Page::Info => shell::show_screen(ui, &mut InfoScreen, &mut cx, flags),
             Page::TitlePage => shell::show_screen(
                 ui,
@@ -3135,6 +3121,17 @@ impl ScriptApp {
             self.show_right = inspector_on
         }
         self.inspector_tabs.insert(key, tab);
+        if let Some(label) = out.goto_screen.take() {
+            // Ir a la pantalla en la que está otra persona.
+            let target = Workspace::ALL
+                .iter()
+                .flat_map(|w| w.screens())
+                .find(|(_, name, _)| *name == label)
+                .map(|(_, _, page)| page);
+            if let Some(target) = target {
+                self.screen = Screen::Project(target);
+            }
+        }
         if let Some(w) = out.inspector_width {
             self.remember_panel_width(ui.ctx(), panel_id, PanelSide::Right, w);
         }
@@ -3608,6 +3605,26 @@ impl ScriptApp {
             }
             None => "Iniciar sesión".to_string(),
         };
+        // Los proyectos de grupo: los que ya están acá dicen a qué grupo pertenecen, y los que faltan se pueden bajar.
+        let downloading = self.cloud.downloading().map(str::to_string);
+        for card in &mut self.cards {
+            if let Some(badge) = &mut card.cloud {
+                badge.group = self.cloud.group_name(&badge.group_id).unwrap_or_default().to_string();
+                badge.syncing = downloading.as_deref() == Some(badge.project_id.as_str());
+            }
+        }
+        let remote: Vec<crate::pages::RemoteCard> = self
+            .cloud
+            .group_projects()
+            .into_iter()
+            .filter(|g| !self.cards.iter().any(|c| c.cloud.as_ref().is_some_and(|b| b.project_id == g.id)))
+            .map(|g| crate::pages::RemoteCard {
+                downloading: downloading.as_deref() == Some(g.id.as_str()),
+                project: g.id,
+                name: g.name,
+                group: g.group,
+            })
+            .collect();
         let history: Vec<String> = Vec::new();
         let mut cx = ScreenCx::new(
             &mut self.project,
@@ -3620,6 +3637,7 @@ impl ScriptApp {
             ui,
             &mut crate::screens::HomeScreen {
                 cards: &self.cards,
+                remote: &remote,
                 action: &mut action,
                 account: &account,
             },
@@ -3629,6 +3647,7 @@ impl ScriptApp {
             Some(HomeAction::Create) => self.start_project(Project::default(), None),
             Some(HomeAction::Open) => self.open_dialog(),
             Some(HomeAction::OpenRecent(path)) => self.open_path(&path),
+            Some(HomeAction::Download(id)) => self.cloud.download(&id),
             Some(HomeAction::Settings) => self.show_settings = true,
             Some(HomeAction::Cloud) => self.cloud.open = true,
             None => {}
@@ -4115,6 +4134,12 @@ mod tests {
                 logline: "Una descripción muy larga ".repeat(20),
                 cover: Some(PathBuf::from("/tmp/no-existe.png")),
                 modified: None,
+                cloud: Some(storage::CloudBadge {
+                    group_id: String::new(),
+                    project_id: String::new(),
+                    group: "Un grupo con un nombre bastante largo para la tarjeta".into(),
+                    syncing: true,
+                }),
             },
             RecentCard {
                 path: PathBuf::from("/tmp/dos.spd"),
@@ -4122,6 +4147,7 @@ mod tests {
                 logline: String::new(),
                 cover: None,
                 modified: None,
+                cloud: None,
             },
         ];
         app.screen = Screen::Home;

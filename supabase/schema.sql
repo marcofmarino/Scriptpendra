@@ -338,6 +338,30 @@ begin
   return inv.group_id;
 end $$;
 
+-- Salir de un grupo. Si queda alguien y nadie es dueño, el miembro más antiguo pasa a serlo. Si no queda nadie, el grupo se borra
+-- con todo lo que tiene (proyectos, secciones y la lista de imágenes). Los archivos de imágenes viven en Storage y SQL no los
+-- puede borrar: el programa los quita antes de salir, cuando es la última persona.
+create or replace function public.leave_group(gid uuid)
+returns void language plpgsql security definer set search_path = '' as $$
+declare
+  uid uuid := auth.uid();
+begin
+  if uid is null then raise exception 'sin sesión' using errcode = '28000'; end if;
+  if not public.is_member(gid) then raise exception 'no permitido' using errcode = '42501'; end if;
+  -- Se bloquea el grupo: si salen las dos últimas personas a la vez, una espera a la otra y el grupo se borra una sola vez.
+  perform 1 from public.groups g where g.id = gid for update;
+  delete from public.presence p
+    where p.user_id = uid and p.project_id in (select pr.id from public.projects pr where pr.group_id = gid);
+  delete from public.memberships m where m.group_id = gid and m.user_id = uid;
+  if not exists (select 1 from public.memberships m where m.group_id = gid) then
+    delete from public.groups g where g.id = gid;
+  elsif not exists (select 1 from public.memberships m where m.group_id = gid and m.role = 'owner') then
+    update public.memberships m set role = 'owner'
+    where m.group_id = gid
+      and m.user_id = (select m2.user_id from public.memberships m2 where m2.group_id = gid order by m2.joined_at limit 1);
+  end if;
+end $$;
+
 -- Crea un proyecto en un grupo (máximo 30 por grupo).
 create or replace function public.create_project(gid uuid, project_name text)
 returns uuid language plpgsql security definer set search_path = '' as $$
@@ -501,7 +525,7 @@ revoke all on all functions in schema public from public, anon, authenticated;
 alter default privileges revoke execute on functions from public;
 grant execute on function public.is_member(uuid), public.is_owner(uuid), public.is_admin(),
   public.project_group(uuid), public.shares_group_with(uuid),
-  public.create_group(text), public.create_invite(uuid), public.join_group(text),
+  public.create_group(text), public.create_invite(uuid), public.join_group(text), public.leave_group(uuid),
   public.create_project(uuid, text), public.push_section(uuid, text, bigint, text, text),
   public.reserve_image(uuid, text, text, bigint), public.release_image(uuid, text),
   public.my_name(), public.set_display_name(text),

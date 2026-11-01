@@ -3,12 +3,17 @@
 ## Puesta en marcha (una sola vez, la hace quien administra)
 
 1. Crear un proyecto en <https://supabase.com> (plan gratuito).
-2. **SQL Editor** → pegar `schema.sql` entero → *Run*. Se puede volver a correr sin borrar datos.
+2. **SQL Editor** → pegar `schema.sql` entero → *Run*. Se puede volver a correr sin borrar datos (también al actualizar el programa: agrega `leave_group`, para salir de un grupo).
 3. **SQL Editor** → pegar `tests.sql` → *Run*. Tiene que terminar con `TODAS LAS PRUEBAS PASARON`. Si no, no usar la base.
 4. **Authentication → Providers → Email**: dejar activado **Confirm email**. Eso se configura en el panel de Supabase (no se puede
    dejar hecho desde el código ni desde `schema.sql`). Con eso activado, quien crea una cuenta recibe un mail y no puede iniciar
    sesión hasta abrirlo; el programa le avisa «Falta confirmar el mail». Mientras tanto, en el mismo lugar conviene poner la
    longitud mínima de contraseña en 10 (el programa ya la pide al crear la cuenta).
+   **Authentication → Email Templates → Confirm signup**: reemplazar el enlace del mensaje por el código, igual que en el paso
+   siguiente: `<p>Tu código para confirmar la cuenta de Scriptpendra es:</p><h2>{{ .Token }}</h2>`
+   **No dejar `{{ .ConfirmationURL }}`**: ese enlace abre la *Site URL* en el navegador y puede mostrar una página que no carga.
+   Con solo el código, el programa muestra «Revisá tu mail» y la persona lo escribe ahí y entra, sin salir del programa.
+   El código vence a la hora (si vence, se crea la cuenta de nuevo).
 5. **Authentication → Email Templates → Reset Password**: reemplazar el enlace del mensaje por el código, por ejemplo:
    `<p>Tu código para recuperar la contraseña de Scriptpendra es:</p><h2>{{ .Token }}</h2>`
    El programa no tiene página web a la que mande el enlace: la persona escribe el código en «Olvidé mi contraseña». El

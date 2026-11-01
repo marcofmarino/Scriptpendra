@@ -9,6 +9,7 @@ use super::{
     tokens::*,
 };
 use crate::{
+    cloud::Peer,
     icon,
     theme::{self, Palette},
 };
@@ -43,7 +44,7 @@ pub enum Zone {
 }
 
 /// Fila del título de la pantalla (`TITLE_H`): el título a 24 del borde izquierdo, alineado con el margen del contenido.
-pub fn title_row(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui)) {
+pub fn title_row(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui), end: impl FnOnce(&mut Ui)) {
     egui::Panel::top("shell_title")
         .exact_size(TITLE_H)
         .resizable(false)
@@ -56,8 +57,66 @@ pub fn title_row(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui)) {
         }))
         .show(ui, |ui| {
             ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-            ui.with_layout(Layout::left_to_right(Align::Center), add);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                end(ui);
+                ui.with_layout(Layout::left_to_right(Align::Center), add);
+            });
         });
+}
+
+/// Cuántos círculos de personas se dibujan antes de juntar el resto en un «+N».
+const PEERS_SHOWN: usize = 5;
+const PEER_SIZE: f32 = 26.0;
+
+/// Las personas conectadas al proyecto, contra el borde derecho de la fila del título: un círculo con la inicial de cada una (del
+/// color de su nombre). Al pasar el mouse dice quién es y dónde está; al hacer clic devuelve la pantalla en la que está.
+fn peers_row(ui: &mut Ui, p: &Palette, peers: &[Peer]) -> Option<String> {
+    let mut goto = None;
+    let hidden = peers.len().saturating_sub(PEERS_SHOWN);
+    ui.spacing_mut().item_spacing.x = SP_XS;
+    if hidden > 0 {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(PEER_SIZE, PEER_SIZE), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), PEER_SIZE / 2.0, p.container_hi);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("+{hidden}"),
+            egui::FontId::new(FONT_SMALL, theme::bold_family()),
+            p.text,
+        );
+        let names: Vec<&str> = peers[PEERS_SHOWN..].iter().map(|x| x.who.as_str()).collect();
+        resp.on_hover_text(names.join(", "));
+    }
+    // Se dibujan de derecha a izquierda: la primera persona queda más cerca del borde.
+    for peer in peers.iter().take(PEERS_SHOWN) {
+        let name = if peer.who.is_empty() { "Alguien" } else { peer.who.as_str() };
+        let color = theme::character_color(name);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(PEER_SIZE, PEER_SIZE), egui::Sense::click());
+        let hover = kit::fade(ui, resp.id.with("hover"), resp.hovered(), ANIM_FAST);
+        ui.painter().circle_filled(rect.center(), PEER_SIZE / 2.0 + hover * 1.5, color);
+        ui.painter().circle_stroke(rect.center(), PEER_SIZE / 2.0, egui::Stroke::new(1.5, p.panel));
+        let initial = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            initial,
+            egui::FontId::new(FONT_SMALL, theme::bold_family()),
+            theme::ink_on(color, p),
+        );
+        let place = match (peer.screen.is_empty(), peer.detail.is_empty()) {
+            (true, _) => String::new(),
+            (false, true) => peer.screen.clone(),
+            (false, false) => format!("{} · {}", peer.screen, peer.detail),
+        };
+        let tip = if place.is_empty() { name.to_string() } else { format!("{name}\n{place}  (clic para ir)") };
+        let resp = resp.on_hover_text(tip);
+        if !peer.screen.is_empty() {
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                goto = Some(peer.screen.clone());
+            }
+        }
+    }
+    goto
 }
 
 /// Barra de herramientas (`TOOLBAR_H`): a la izquierda Deshacer y Rehacer (los dibuja el marco), en el centro lo propio de la
@@ -424,6 +483,8 @@ pub struct ShellFlags<'a> {
     pub panel_default: f32,
     /// Clave de la pantalla: cuando cambia, el contenido aparece con un fundido.
     pub page_key: &'a str,
+    /// Quién más está en el proyecto compartido (arriba a la derecha).
+    pub peers: &'a [Peer],
 }
 
 /// Lo que devuelve el marco.
@@ -431,6 +492,8 @@ pub struct ShellFlags<'a> {
 pub struct ShellOut {
     /// Ancho medido del inspector fijo, para recordarlo.
     pub inspector_width: Option<f32>,
+    /// Se hizo clic en una persona conectada: el nombre de la pantalla en la que está.
+    pub goto_screen: Option<String>,
 }
 
 fn inspector_contents(
@@ -471,11 +534,16 @@ pub fn show_screen(
 
     // Arriba, a todo el ancho que queda a la derecha de la barra lateral (sobre el contenido y el inspector): la fila del
     // título y la barra de herramientas.
-    title_row(ui, p, |ui| {
-        if !screen.title_ui(ui, cx) {
-            kit::screen_title(ui, p, &title);
-        }
-    });
+    title_row(
+        ui,
+        p,
+        |ui| {
+            if !screen.title_ui(ui, cx) {
+                kit::screen_title(ui, p, &title);
+            }
+        },
+        |ui| out.goto_screen = peers_row(ui, p, flags.peers),
+    );
     let history = History {
         can_undo: screen.can_undo(cx),
         can_redo: screen.can_redo(cx),

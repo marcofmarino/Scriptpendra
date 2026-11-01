@@ -207,6 +207,35 @@ begin
     (select count(*) from storage.objects where bucket_id = 'images' and name like ga::text || '/%'), 0::bigint);
 end $$;
 
+-- Salir de un grupo: el grupo se queda mientras haya alguien y se borra con la última persona.
+do $$
+declare
+  a uuid := '00000000-0000-0000-0000-0000000000a1';
+  b uuid := '00000000-0000-0000-0000-0000000000b2';
+  gc uuid; gd uuid; pc uuid; code text;
+begin
+  perform pg_temp.as_user(a);
+  gc := public.create_group('Grupo C');
+  gd := public.create_group('Grupo D');
+  pc := public.create_project(gc, 'Corto C');
+  code := public.create_invite(gc);
+  perform pg_temp.as_user(b);
+  perform public.join_group(code);
+  perform pg_temp.must_fail('quien no es del grupo no puede salir de él', format('select public.leave_group(%L)', gd), 'no permitido');
+  perform public.set_presence(pc, 'x', 'Guion', '');
+  perform public.leave_group(gc);
+  perform pg_temp.must_equal('al salir ya no ve el grupo', (select count(*) from public.groups where id = gc), 0::bigint);
+  perform pg_temp.as_user(a);
+  perform pg_temp.must_equal('el grupo sigue mientras quede alguien', (select count(*) from public.groups where id = gc), 1::bigint);
+  perform pg_temp.must_equal('quien se quedó sigue de dueño',
+    (select count(*) from public.memberships where group_id = gc and role = 'owner'), 1::bigint);
+  perform public.leave_group(gc);
+  perform pg_temp.as_admin_db();
+  perform pg_temp.must_equal('sin nadie, el grupo se borra', (select count(*) from public.groups where id = gc), 0::bigint);
+  perform pg_temp.must_equal('y también sus proyectos', (select count(*) from public.projects where id = pc), 0::bigint);
+  perform pg_temp.must_equal('y su presencia', (select count(*) from public.presence where project_id = pc), 0::bigint);
+end $$;
+
 reset role;
 do $$ begin raise notice 'TODAS LAS PRUEBAS PASARON'; end $$;
 rollback;

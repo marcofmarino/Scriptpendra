@@ -391,6 +391,18 @@ pub struct RecentCard {
     pub logline: String,
     pub cover: Option<PathBuf>,
     pub modified: Option<SystemTime>,
+    /// Si el proyecto está unido a un grupo de la nube.
+    pub cloud: Option<CloudBadge>,
+}
+
+/// Lo que la tarjeta de un proyecto de grupo dice de la nube. La app completa `group` y `syncing` en cada cuadro.
+#[derive(Clone)]
+pub struct CloudBadge {
+    pub group_id: String,
+    pub project_id: String,
+    /// El nombre del grupo (vacío hasta que se sabe cuál es).
+    pub group: String,
+    pub syncing: bool,
 }
 
 pub fn recent_cards(settings: &Settings) -> Vec<RecentCard> {
@@ -407,6 +419,12 @@ pub fn recent_cards(settings: &Settings) -> Vec<RecentCard> {
                 logline: project.logline,
                 cover,
                 modified,
+                cloud: crate::cloudsync::CloudLink::load(path).map(|l| CloudBadge {
+                    group_id: l.group,
+                    project_id: l.project,
+                    group: String::new(),
+                    syncing: false,
+                }),
             })
         })
         .collect()

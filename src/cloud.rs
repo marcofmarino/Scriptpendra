@@ -55,6 +55,8 @@ pub enum CloudError {
     Offline(&'static str),
     NotSignedIn,
     BadLogin,
+    /// La cuenta existe pero falta abrir el mail de confirmación.
+    Unconfirmed,
     Forbidden,
     /// Alguien escribió antes: hay que traer lo nuevo, combinar y reintentar.
     Conflict,
@@ -75,6 +77,7 @@ impl CloudError {
             CloudError::Offline(why) => format!("No hay conexión con la nube ({why})."),
             CloudError::NotSignedIn => "Tenés que iniciar sesión.".into(),
             CloudError::BadLogin => "El mail o la contraseña no son correctos.".into(),
+            CloudError::Unconfirmed => "Falta confirmar el mail: escribí el código que te mandamos.".into(),
             CloudError::Forbidden => "No tenés permiso para hacer eso.".into(),
             CloudError::Conflict => "Otra persona guardó antes: hay que traer sus cambios.".into(),
             CloudError::QuotaFull => "El grupo llenó el espacio para imágenes. Quitá algunas que no uses.".into(),
@@ -93,7 +96,7 @@ fn map_error(status: u16, body: &[u8]) -> CloudError {
     let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     // Al iniciar sesión con un mail sin confirmar, Supabase lo avisa con este código.
     if value.get("error_code").and_then(Value::as_str) == Some("email_not_confirmed") {
-        return CloudError::Invalid("Falta confirmar el mail: abrí el mensaje que te mandamos y después iniciá sesión.".into());
+        return CloudError::Unconfirmed;
     }
     let code = value.get("code").map(|c| c.to_string().trim_matches('"').to_string()).unwrap_or_default();
     match code.as_str() {
@@ -590,6 +593,28 @@ impl<T: Transport> Client<T> {
         }
     }
 
+    /// Confirma la cuenta nueva con el código del mail y deja la sesión iniciada: así no hace falta volver a escribir nada.
+    pub fn confirm_signup(&mut self, email: &str, code: &str) -> Result<(), CloudError> {
+        if !is_email_shape(email) {
+            return Err(CloudError::Invalid("El mail no parece válido.".into()));
+        }
+        if !is_recovery_code(code) {
+            return Err(CloudError::Invalid("El código son solo números (los que vienen en el mail).".into()));
+        }
+        let body = json!({"type": "signup", "email": email.trim(), "token": code.trim()}).to_string().into_bytes();
+        let request = self.request(Method::Post, "/auth/v1/verify", Vec::new(), body, MAX_JSON_BYTES);
+        let value = self.send_json(request).map_err(|e| match e {
+            CloudError::BadLogin | CloudError::Forbidden | CloudError::NotSignedIn => {
+                CloudError::Invalid("El código no es correcto o ya venció.".into())
+            }
+            other => other,
+        })?;
+        let session = self.session_from(&value)?;
+        store_session(&self.url, &session);
+        self.session = Some(session);
+        Ok(())
+    }
+
     /// Pide el mail con el código para recuperar la contraseña. Supabase contesta lo mismo exista la cuenta o no, así que no
     /// se puede usar para averiguar quién tiene cuenta.
     pub fn request_recovery(&mut self, email: &str) -> Result<(), CloudError> {
@@ -733,6 +758,48 @@ impl<T: Transport> Client<T> {
     pub fn create_group(&mut self, name: &str) -> Result<String, CloudError> {
         let v = self.rpc("create_group", json!({"group_name": name}))?;
         v.as_str().filter(|s| is_uuid(s)).map(str::to_string).ok_or(CloudError::Protocol)
+    }
+
+    /// Sale de un grupo. Si es la última persona, el grupo se borra: antes se quitan sus imágenes de Storage (la base no puede).
+    pub fn leave_group(&mut self, group: &str) -> Result<(), CloudError> {
+        Self::uuid_arg(group)?;
+        let members = self.select("memberships", vec![("select", "user_id".into()), ("group_id", format!("eq.{group}"))], MAX_JSON_BYTES)?;
+        if members.as_array().ok_or(CloudError::Protocol)?.len() <= 1 {
+            let v = self.select(
+                "images",
+                vec![("select", "project_id,hash,ext".into()), ("group_id", format!("eq.{group}"))],
+                MAX_JSON_BYTES,
+            )?;
+            for r in v.as_array().ok_or(CloudError::Protocol)? {
+                let (Some(project), Some(hash), Some(ext)) = (
+                    r.get("project_id").and_then(Value::as_str).filter(|s| is_uuid(s)),
+                    r.get("hash").and_then(Value::as_str).filter(|h| is_hash(h)),
+                    r.get("ext").and_then(Value::as_str).filter(|e| is_image_ext(e)),
+                ) else {
+                    continue;
+                };
+                self.delete_image(group, project, hash, ext)?;
+            }
+        }
+        self.rpc("leave_group", json!({"gid": group})).map(|_| ())
+    }
+
+    /// Todos los proyectos de todos los grupos de la persona: (id, nombre, id del grupo).
+    pub fn all_projects(&mut self) -> Result<Vec<(String, String, String)>, CloudError> {
+        let v = self.select(
+            "projects",
+            vec![("select", "id,name,group_id".into()), ("order", "name.asc".into()), ("limit", "500".into())],
+            MAX_JSON_BYTES,
+        )?;
+        let rows = v.as_array().ok_or(CloudError::Protocol)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let id = r.get("id")?.as_str().filter(|s| is_uuid(s))?.to_string();
+                let group = r.get("group_id")?.as_str().filter(|s| is_uuid(s))?.to_string();
+                Some((id, r.get("name")?.as_str()?.chars().filter(|c| !c.is_control()).take(120).collect(), group))
+            })
+            .collect())
     }
 
     pub fn create_invite(&mut self, group: &str) -> Result<String, CloudError> {
@@ -1320,10 +1387,8 @@ mod tests {
         assert_eq!(map_error(403, br#"{"code":"42501"}"#), CloudError::Forbidden);
         assert_eq!(map_error(401, b"{}"), CloudError::NotSignedIn);
         assert_eq!(map_error(400, b"{}"), CloudError::BadLogin);
-        assert!(matches!(
-            map_error(400, br#"{"error_code":"email_not_confirmed","msg":"Email not confirmed"}"#),
-            CloudError::Invalid(m) if m.contains("confirmar el mail")
-        ));
+        assert_eq!(map_error(400, br#"{"error_code":"email_not_confirmed","msg":"Email not confirmed"}"#), CloudError::Unconfirmed);
+        assert!(CloudError::Unconfirmed.message().contains("confirmar el mail"));
         assert_eq!(map_error(503, b"cualquier cosa"), CloudError::Server(503));
         assert_eq!(map_error(200, b"no es json"), CloudError::Protocol);
         assert!(!CloudError::Server(500).message().contains("select"));
@@ -1439,6 +1504,53 @@ mod tests {
         let peers = c.presence(UUID_B).unwrap();
         assert_eq!(peers, vec![Peer { who: "Ana".into(), screen: "Guion".into(), detail: "escena 3".into() }]);
         assert!(matches!(c.presence("../x"), Err(CloudError::Invalid(_))));
+        c.sign_out_without_keyring();
+    }
+
+    #[test]
+    fn leaving_as_the_last_member_removes_the_images_first_and_a_member_among_others_just_leaves() {
+        let fake = Fake::default();
+        let mut c = client(&fake);
+        login(&fake, &mut c);
+        // Hay más gente: solo se sale.
+        fake.reply(200, r#"[{"user_id":"a"},{"user_id":"b"}]"#);
+        fake.reply(200, "null");
+        c.leave_group(UUID_A).unwrap();
+        let seen = fake.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].path.ends_with("/rpc/leave_group"));
+        fake.seen.lock().unwrap().clear();
+        // Es la última persona: se borra cada imagen (reserva y archivo) y recién después se sale.
+        let hash = "a".repeat(64);
+        fake.reply(200, r#"[{"user_id":"a"}]"#);
+        fake.reply(200, &format!(r#"[{{"project_id":"{UUID_B}","hash":"{hash}","ext":"png"}}]"#));
+        fake.reply(200, "null");
+        fake.reply(200, "{}");
+        fake.reply(200, "null");
+        c.leave_group(UUID_A).unwrap();
+        let seen = fake.seen.lock().unwrap().clone();
+        assert!(seen[2].path.ends_with("/rpc/release_image"));
+        assert!(seen[3].path.contains("/storage/v1/object/images/"));
+        assert!(seen[4].path.ends_with("/rpc/leave_group"));
+        assert!(matches!(c.leave_group("../x"), Err(CloudError::Invalid(_))));
+        c.sign_out_without_keyring();
+    }
+
+    #[test]
+    fn confirming_a_new_account_with_the_code_signs_in_and_an_unconfirmed_login_is_told_apart() {
+        let fake = Fake::default();
+        let mut c = client(&fake);
+        fake.reply(400, r#"{"error_code":"email_not_confirmed","msg":"Email not confirmed"}"#);
+        assert_eq!(c.sign_in("a@b.co", "una-clave-larga"), Err(CloudError::Unconfirmed));
+        assert!(matches!(c.confirm_signup("a@b.co", "12ab"), Err(CloudError::Invalid(_))));
+        fake.reply(403, r#"{"error_code":"otp_expired"}"#);
+        assert!(matches!(c.confirm_signup("a@b.co", "123456"), Err(CloudError::Invalid(_))));
+        fake.reply(
+            200,
+            &format!(r#"{{"access_token":"tok","refresh_token":"ref","expires_in":3600,"user":{{"id":"{UUID_A}","email":"a@b.co"}}}}"#),
+        );
+        c.confirm_signup("a@b.co", "123456").unwrap();
+        assert_eq!(c.email(), Some("a@b.co"));
         c.sign_out_without_keyring();
     }
 

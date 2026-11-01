@@ -27,6 +27,12 @@ const SYNC_SLOW_SECS: f64 = 15.0;
 /// Cada cuántos segundos se avisa dónde estoy (el servidor da por ido a quien lleva más de 30 sin avisar).
 const PRESENCE_SECS: f64 = 8.0;
 
+/// Cada cuántos segundos se vuelve a mirar qué proyectos hay en los grupos (para la pantalla de inicio).
+const CATALOG_SECS: f64 = 30.0;
+
+/// Cada cuántos segundos se prueba si ya se confirmó el mail de la cuenta nueva.
+const CONFIRM_SECS: f64 = 4.0;
+
 enum Job {
     SignIn(String, String),
     SignUp(String, String),
@@ -34,6 +40,12 @@ enum Job {
     Recover(String),
     /// Mail, código y contraseña nueva.
     ResetPassword(String, String, String),
+    /// Mail y código para confirmar la cuenta nueva.
+    ConfirmSignup(String, String),
+    /// Prueba entrar con la cuenta nueva: funciona en cuanto se abre el enlace del mail.
+    WaitConfirm(String, String),
+    Leave(String),
+    AllProjects,
     SignOut,
     Groups,
     CreateGroup(String),
@@ -77,6 +89,10 @@ enum Event {
     SignedIn(String),
     SignedOut,
     NeedsConfirmation,
+    /// Todavía no se confirmó el mail.
+    StillWaiting,
+    Left(String),
+    AllProjects(Vec<(String, String, String)>),
     RecoverySent,
     Groups(Vec<(String, String, i64)>),
     Invite(String),
@@ -138,6 +154,21 @@ fn run(client: &mut Client<HttpsTransport>, job: Job) -> Event {
             Ok(()) => Event::SignedIn(client.email().unwrap_or_default().to_string()),
             Err(e) => fail(e),
         },
+        Job::ConfirmSignup(email, code) => match client.confirm_signup(&email, &code) {
+            Ok(()) => Event::SignedIn(client.email().unwrap_or_default().to_string()),
+            Err(e) => fail(e),
+        },
+        Job::WaitConfirm(email, password) => match client.sign_in(&email, &password) {
+            Ok(()) => Event::SignedIn(client.email().unwrap_or_default().to_string()),
+            // Sin red o sin confirmar todavía: se sigue esperando sin mostrar un error.
+            Err(cloud::CloudError::Unconfirmed | cloud::CloudError::Offline(_) | cloud::CloudError::TooMany) => Event::StillWaiting,
+            Err(e) => fail(e),
+        },
+        Job::Leave(group) => match client.leave_group(&group) {
+            Ok(()) => Event::Left(group),
+            Err(e) => fail(e),
+        },
+        Job::AllProjects => client.all_projects().map(Event::AllProjects).unwrap_or_else(|_| Event::AllProjects(Vec::new())),
         Job::SignOut => {
             client.sign_out();
             Event::SignedOut
@@ -176,6 +207,13 @@ fn run(client: &mut Client<HttpsTransport>, job: Job) -> Event {
             .map(|(used, quota, count)| Event::Usage(used, quota, count))
             .unwrap_or_else(fail),
     }
+}
+
+/// Un proyecto de un grupo (para la pantalla de inicio).
+pub struct GroupProject {
+    pub id: String,
+    pub name: String,
+    pub group: String,
 }
 
 /// Lo que la ventana le pide a la app después de cada cuadro.
@@ -229,6 +267,19 @@ pub struct CloudUi {
     images_busy: bool,
     presence_busy: bool,
     last_presence: f64,
+    /// Los proyectos de todos mis grupos: (id, nombre, id del grupo).
+    catalog: Vec<(String, String, String)>,
+    catalog_busy: bool,
+    last_catalog: f64,
+    /// El proyecto de grupo que se está bajando (su id).
+    downloading: Option<String>,
+    /// Cuenta nueva que espera la confirmación del mail: (mail, contraseña). Solo vive en memoria.
+    awaiting: Option<(String, String)>,
+    confirm_code: String,
+    wait_busy: bool,
+    last_wait: f64,
+    /// El grupo del que se pidió salir y falta confirmar.
+    leave_confirm: Option<String>,
     last_sync: f64,
     /// Entrar o crear cuenta (0 / 1) y si se ve la contraseña.
     login_mode: usize,
@@ -315,6 +366,9 @@ impl CloudUi {
                     self.code.clear();
                     self.signed_as = Some(email);
                     self.password.clear();
+                    self.awaiting = None;
+                    self.confirm_code.clear();
+                    self.wait_busy = false;
                     self.note.clear();
                     self.name_loaded = false;
                     self.send(Job::Groups);
@@ -337,16 +391,38 @@ impl CloudUi {
                     self.signed_as = None;
                     self.groups.clear();
                     self.projects.clear();
+                    self.catalog.clear();
                 }
                 Event::RecoverySent => {
                     self.code_sent = true;
                     self.note = "Si el mail tiene cuenta, te mandamos un código. Puede tardar un minuto.".into();
                 }
                 Event::NeedsConfirmation => {
-                    self.note = "Te mandamos un mail para confirmar la cuenta. Abrilo y después iniciá sesión.".into();
+                    self.note = "Te mandamos un mail para confirmar la cuenta.".into();
+                    self.awaiting = Some((self.email.trim().to_string(), std::mem::take(&mut self.password)));
+                    self.confirm_code.clear();
+                    self.last_wait = f64::NEG_INFINITY;
+                }
+                Event::StillWaiting => self.wait_busy = false,
+                Event::Left(group) => {
+                    self.leave_confirm = None;
+                    self.selected_group = None;
+                    self.invite = None;
+                    self.projects.clear();
+                    self.note.clear();
+                    if link.is_some_and(|l| l.group == group) {
+                        out.unlink = true;
+                    }
+                    out.message = Some("Saliste del grupo.".into());
+                    self.send(Job::Groups);
+                }
+                Event::AllProjects(list) => {
+                    self.catalog_busy = false;
+                    self.catalog = list;
                 }
                 Event::Groups(groups) => {
                     self.groups = groups;
+                    self.request_catalog();
                     if self.selected_group.is_none_or(|i| i >= self.groups.len()) {
                         self.selected_group = (!self.groups.is_empty()).then_some(0);
                     }
@@ -359,10 +435,12 @@ impl CloudUi {
                 }
                 Event::Projects(list) => self.projects = list,
                 Event::Shared(new_link) => {
+                    self.request_catalog();
                     out.message = Some("Proyecto compartido en la nube.".into());
                     out.link = Some(new_link);
                 }
                 Event::Opened(path, new_link) => {
+                    self.downloading = None;
                     out.link = Some(new_link);
                     out.open = Some(path);
                 }
@@ -394,6 +472,8 @@ impl CloudUi {
                 }
                 Event::Error(message) => {
                     self.syncing = false;
+                    self.downloading = None;
+                    self.wait_busy = false;
                     self.note = message.clone();
                     if self.open || self.signed_as.is_some() {
                         out.message = Some(message);
@@ -410,10 +490,81 @@ impl CloudUi {
             self.syncing = true;
             self.send(Job::Sync { file: file.to_path_buf(), link: link.clone(), who: settings.author() });
         }
+        // La lista de proyectos de los grupos, para la pantalla de inicio.
+        if self.signed_as.is_some() && self.cloud_name.is_some() && now - self.last_catalog > CATALOG_SECS {
+            self.request_catalog();
+            self.last_catalog = now;
+        }
+        // Cuenta nueva sin confirmar: se prueba entrar cada tanto, así basta con abrir el mail.
+        if let Some((email, password)) = &self.awaiting
+            && self.signed_as.is_none()
+            && !self.wait_busy
+            && now - self.last_wait > CONFIRM_SECS
+            && let Some(tx) = &self.tx
+        {
+            self.last_wait = now;
+            self.wait_busy = tx.send(Job::WaitConfirm(email.clone(), password.clone())).is_ok();
+        }
+        if self.tx.is_some() && (self.awaiting.is_some() || self.signed_as.is_some()) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(if self.awaiting.is_some() { CONFIRM_SECS } else { CATALOG_SECS }));
+        }
         if self.tx.is_some() && file.is_some() && link.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(if fast { SYNC_FAST_SECS } else { SYNC_SLOW_SECS }));
         }
         out
+    }
+
+    /// Pide la lista de proyectos de todos los grupos (sin marcar la ventana como ocupada).
+    fn request_catalog(&mut self) {
+        if self.catalog_busy {
+            return;
+        }
+        if let Some(tx) = &self.tx
+            && tx.send(Job::AllProjects).is_ok()
+        {
+            self.catalog_busy = true;
+        }
+    }
+
+    /// Los proyectos de mis grupos, con el nombre de su grupo.
+    pub fn group_projects(&self) -> Vec<GroupProject> {
+        self.catalog
+            .iter()
+            .map(|(id, name, group)| GroupProject {
+                id: id.clone(),
+                name: name.clone(),
+                group: self.groups.iter().find(|g| &g.0 == group).map(|g| g.1.clone()).unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    /// El nombre de un grupo mío.
+    pub fn group_name(&self, id: &str) -> Option<&str> {
+        self.groups.iter().find(|g| g.0 == id).map(|g| g.1.as_str())
+    }
+
+    /// El proyecto de grupo que se está bajando, si hay uno.
+    pub fn downloading(&self) -> Option<&str> {
+        self.downloading.as_deref()
+    }
+
+    /// Baja un proyecto de un grupo: la persona elige dónde dejar la copia y se abre sola al terminar.
+    pub fn download(&mut self, project: &str) {
+        if self.downloading.is_some() {
+            return;
+        }
+        let Some((id, name, group)) = self.catalog.iter().find(|c| c.0 == project).cloned() else {
+            return;
+        };
+        let Some(chosen) = rfd::FileDialog::new().set_file_name(format!("{name}.{}", crate::storage::EXTENSION)).save_file() else {
+            return;
+        };
+        let file = crate::assets::project_file_for(&chosen);
+        if let Some(tx) = &self.tx
+            && tx.send(Job::Open { group, project: id.clone(), file }).is_ok()
+        {
+            self.downloading = Some(id);
+        }
     }
 
     /// Manda un trabajo de imágenes (si no hay otro en curso).
@@ -548,6 +699,7 @@ impl CloudUi {
             out.settings_changed = true;
         }
         if let Some(i) = chosen_group {
+            self.leave_confirm = None;
             self.selected_group = Some(i);
             self.refresh_group();
         }
@@ -641,6 +793,10 @@ fn login_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, jo
         recovery_view(ui, p, this, busy, job);
         return;
     }
+    if this.awaiting.is_some() {
+        confirm_view(ui, p, this, busy, job);
+        return;
+    }
     ui.vertical_centered(|ui| {
         badge(ui, theme_icon(), theme::mix(p.container, p.accent, 0.25), 52.0, egui::FontId::proportional(26.0), p.accent);
         ui.add_space(tokens::SP_S);
@@ -711,6 +867,49 @@ fn login_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, jo
     if signup {
         ui.add_space(tokens::SP_S);
         ui.label(RichText::new("Te vamos a mandar un mail para confirmar la cuenta.").size(tokens::FONT_SMALL).color(p.dim));
+    }
+}
+
+/// Cuenta nueva: se espera a que abra el mail. Entra sola en cuanto lo confirma, o escribiendo el código que llega.
+fn confirm_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, job: &mut Option<Job>) {
+    let email = this.awaiting.as_ref().map(|a| a.0.clone()).unwrap_or_default();
+    ui.vertical_centered(|ui| {
+        badge(ui, crate::icon::CLOUD, theme::mix(p.container, p.accent, 0.25), 52.0, egui::FontId::proportional(26.0), p.accent);
+        ui.add_space(tokens::SP_S);
+        ui.label(RichText::new("Revisá tu mail").font(egui::FontId::new(tokens::FONT_TITLE, theme::bold_family())).color(p.text));
+        ui.label(RichText::new(format!("Te mandamos un mensaje a {email}.")).color(p.dim));
+    });
+    ui.add_space(tokens::SP_M);
+    message_line(ui, p, "Abrí el enlace del mail y esta ventana entra sola, o escribí acá el código que viene en el mensaje.", false);
+    ui.add_space(tokens::SP_M);
+    let resp = labeled(ui, p, "Código del mail", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut this.confirm_code).hint_text("123456").desired_width(f32::INFINITY))
+    });
+    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let missing = if !cloud::is_recovery_code(&this.confirm_code) {
+        Some("Falta el código")
+    } else if busy {
+        Some("Un momento…")
+    } else {
+        None
+    };
+    if (kit::primary_button(ui, p, "Confirmar y entrar", missing).clicked() || (enter && missing.is_none())) && missing.is_none() {
+        *job = Some(Job::ConfirmSignup(email, this.confirm_code.trim().to_string()));
+    }
+    if !this.note.is_empty() && !this.note.contains("Te mandamos") {
+        ui.add_space(tokens::SP_S);
+        message_line(ui, p, &this.note, true);
+    }
+    ui.add_space(tokens::SP_S);
+    ui.horizontal(|ui| {
+        ui.add(egui::Spinner::new().size(14.0));
+        ui.label(RichText::new("Esperando que confirmes el mail…").size(tokens::FONT_SMALL).color(p.dim));
+    });
+    if ui.link("Volver").clicked() {
+        this.awaiting = None;
+        this.confirm_code.clear();
+        this.login_mode = 0;
+        this.note.clear();
     }
 }
 
@@ -915,6 +1114,26 @@ fn group_view(
             ui.label(RichText::new("Pasale este código a quien quieras sumar. Vale 7 días y se muestra una sola vez:").size(tokens::FONT_SMALL).color(p.dim));
             let mut shown = code.clone();
             ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
+        }
+        ui.add_space(tokens::SP_S);
+        if this.leave_confirm.as_deref() == Some(group_id) {
+            message_line(
+                ui,
+                p,
+                "Si sos la última persona del grupo, el grupo y todos sus proyectos se borran de la nube. Las copias que tenés en esta computadora no se tocan.",
+                true,
+            );
+            ui.add_space(tokens::SP_XS);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new(format!("{}  Sí, salir del grupo", crate::icon::SIGN_OUT))).clicked() {
+                    *job = Some(Job::Leave(group_id.to_string()));
+                }
+                if ui.button("Cancelar").clicked() {
+                    this.leave_confirm = None;
+                }
+            });
+        } else if ui.add_enabled(!busy, egui::Button::new(format!("{}  Salir del grupo", crate::icon::SIGN_OUT))).clicked() {
+            this.leave_confirm = Some(group_id.to_string());
         }
     });
     // El proyecto abierto (desde la pantalla de inicio no hay ninguno).
