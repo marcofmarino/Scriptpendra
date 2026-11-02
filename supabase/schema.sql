@@ -497,12 +497,6 @@ begin
   update public.groups set image_quota_bytes = bytes where id = gid;
 end $$;
 
--- ------------------------------------------------------------------------------------------------
--- Administración para el programa «Scriptpendra Admin». Todas exigen estar en `admins`. Quien administra NO edita proyectos ni
--- informa presencia: solo mira (funciones `admin_*` de lectura) y elimina o cambia usuarios, grupos y proyectos. Cada cambio queda
--- en `admin_log`. Los archivos de imágenes viven en Storage: el programa los borra antes de quitar las filas (hay una política
--- de Storage solo para administradores).
--- ------------------------------------------------------------------------------------------------
 
 create or replace function public.admin_note(act text, tgt text)
 returns void language plpgsql security definer set search_path = '' as $$
@@ -836,5 +830,4 @@ create policy images_storage_admin_delete on storage.objects for delete to authe
 --
 -- Como administrador se pueden ver el uso de todos los grupos y cambiar sus cuotas desde el programa (Nube → Administración)
 -- o con:  select * from public.admin_usage();   select public.admin_set_quota('<id del grupo>', 104857600);
--- El resto de la administración (usuarios, grupos, proyectos, registro) se hace con el programa aparte «Scriptpendra Admin».
 -- ------------------------------------------------------------------------------------------------
