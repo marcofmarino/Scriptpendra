@@ -717,6 +717,7 @@ impl CloudUi {
         let mut acts = Acts { unlink: None, clean: false, open_dest: None };
         let mut sign_out = false;
         let mut save_config = false;
+        let mut change_server = false;
         let author = settings.author();
         // Qué proyectos de esta computadora están unidos a la nube (se leen del disco cada tanto, no en cada cuadro).
         let now = ctx.input(|i| i.time);
@@ -748,7 +749,7 @@ impl CloudUi {
                     return;
                 }
                 let Some(email) = signed.clone() else {
-                    login_view(ui, p, this, busy, &mut job);
+                    login_view(ui, p, this, busy, &mut job, (!built_in).then_some(&mut change_server));
                     return;
                 };
                 account_header(ui, p, &email, this.cloud_name.as_deref(), &mut sign_out);
@@ -776,6 +777,14 @@ impl CloudUi {
         );
         self.config_url = config_url.clone();
         self.config_key = config_key.clone();
+        if change_server {
+            settings.cloud_url.clear();
+            settings.cloud_anon_key.clear();
+            self.config_url.clear();
+            self.config_key.clear();
+            self.note.clear();
+            out.settings_changed = true;
+        }
         if save_config {
             settings.cloud_url = cloud::parse_url(&config_url).unwrap_or_default();
             settings.cloud_anon_key = config_key.trim().to_string();
@@ -875,7 +884,7 @@ fn theme_icon() -> &'static str {
 }
 
 /// Iniciar sesión o crear una cuenta.
-fn login_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, job: &mut Option<Job>) {
+fn login_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, job: &mut Option<Job>, change_server: Option<&mut bool>) {
     if this.forgot {
         recovery_view(ui, p, this, busy, job);
         return;
@@ -954,6 +963,13 @@ fn login_view(ui: &mut egui::Ui, p: &Palette, this: &mut CloudUi, busy: bool, jo
     if signup {
         ui.add_space(tokens::SP_S);
         ui.label(RichText::new("Te vamos a mandar un mail para confirmar la cuenta.").size(tokens::FONT_SMALL).color(p.dim));
+    }
+    // Solo las copias sin la nube incorporada pueden pasarse a otro servidor.
+    if let Some(change) = change_server {
+        ui.add_space(tokens::SP_M);
+        if ui.link("Usar otro servidor").clicked() {
+            *change = true;
+        }
     }
 }
 

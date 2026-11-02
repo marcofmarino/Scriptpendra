@@ -119,6 +119,16 @@ create table if not exists public.presence (
   primary key (project_id, user_id)
 );
 
+-- Lo que hace quien administra (ver `admin_*`). Solo se escribe y se lee con esas funciones.
+create table if not exists public.admin_log (
+  id bigint generated always as identity primary key,
+  at timestamptz not null default now(),
+  admin_id uuid references auth.users (id) on delete set null,
+  admin_name text not null default '' check (char_length(admin_name) <= 60),
+  action text not null check (char_length(action) <= 40),
+  target text not null default '' check (char_length(target) <= 200)
+);
+
 -- ------------------------------------------------------------------------------------------------
 -- Permisos base: el rol `anon` no tiene nada; `authenticated` solo lee (y RLS filtra).
 -- ------------------------------------------------------------------------------------------------
@@ -142,6 +152,7 @@ alter table public.projects enable row level security;
 alter table public.sections enable row level security;
 alter table public.images enable row level security;
 alter table public.presence enable row level security;
+alter table public.admin_log enable row level security;
 alter table public.profiles force row level security;
 alter table public.admins force row level security;
 alter table public.groups force row level security;
@@ -152,6 +163,7 @@ alter table public.projects force row level security;
 alter table public.sections force row level security;
 alter table public.images force row level security;
 alter table public.presence force row level security;
+alter table public.admin_log force row level security;
 
 -- ------------------------------------------------------------------------------------------------
 -- Funciones de ayuda (security definer: evitan que las políticas se llamen a sí mismas)
@@ -485,6 +497,227 @@ begin
   update public.groups set image_quota_bytes = bytes where id = gid;
 end $$;
 
+-- ------------------------------------------------------------------------------------------------
+-- Administración para el programa «Scriptpendra Admin». Todas exigen estar en `admins`. Quien administra NO edita proyectos ni
+-- informa presencia: solo mira (funciones `admin_*` de lectura) y elimina o cambia usuarios, grupos y proyectos. Cada cambio queda
+-- en `admin_log`. Los archivos de imágenes viven en Storage: el programa los borra antes de quitar las filas (hay una política
+-- de Storage solo para administradores).
+-- ------------------------------------------------------------------------------------------------
+
+create or replace function public.admin_note(act text, tgt text)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  insert into public.admin_log (admin_id, admin_name, action, target)
+  values (auth.uid(), public.my_name(), left(act, 40), left(coalesce(tgt, ''), 200));
+end $$;
+
+create or replace function public.admin_users()
+returns table (user_id uuid, email text, display_name text, created_at timestamptz, last_sign_in_at timestamptz, groups bigint, is_admin boolean)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return query
+    select u.id, u.email::text, coalesce(p.display_name, ''), u.created_at, u.last_sign_in_at,
+           (select count(*) from public.memberships m where m.user_id = u.id),
+           exists (select 1 from public.admins a where a.user_id = u.id)
+    from auth.users u left join public.profiles p on p.id = u.id
+    order by u.created_at desc;
+end $$;
+
+create or replace function public.admin_groups()
+returns table (group_id uuid, group_name text, created_at timestamptz, created_by_name text, members bigint, projects bigint, used_bytes bigint, quota_bytes bigint)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return query
+    select g.id, g.name, g.created_at,
+           coalesce((select nullif(p.display_name, '') from public.profiles p where p.id = g.created_by), ''),
+           (select count(*) from public.memberships m where m.group_id = g.id),
+           (select count(*) from public.projects pr where pr.group_id = g.id),
+           coalesce((select sum(i.size) from public.images i where i.group_id = g.id), 0)::bigint,
+           g.image_quota_bytes
+    from public.groups g order by g.created_at desc;
+end $$;
+
+create or replace function public.admin_group_members(gid uuid)
+returns table (user_id uuid, email text, display_name text, role text, joined_at timestamptz)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return query
+    select m.user_id, u.email::text, coalesce(p.display_name, ''), m.role, m.joined_at
+    from public.memberships m
+    join auth.users u on u.id = m.user_id
+    left join public.profiles p on p.id = m.user_id
+    where m.group_id = gid order by m.joined_at;
+end $$;
+
+create or replace function public.admin_group_projects(gid uuid)
+returns table (project_id uuid, project_name text, created_at timestamptz, sections bigint, bytes bigint, updated_at timestamptz)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return query
+    select pr.id, pr.name, pr.created_at,
+           (select count(*) from public.sections s where s.project_id = pr.id),
+           coalesce((select sum(octet_length(s.content)) from public.sections s where s.project_id = pr.id), 0)::bigint,
+           (select max(s.updated_at) from public.sections s where s.project_id = pr.id)
+    from public.projects pr where pr.group_id = gid order by pr.created_at;
+end $$;
+
+create or replace function public.admin_project_sections(pid uuid)
+returns table (name text, version bigint, updated_who text, updated_at timestamptz, bytes integer)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return query
+    select s.name, s.version, s.updated_who, s.updated_at, octet_length(s.content)
+    from public.sections s where s.project_id = pid order by s.name;
+end $$;
+
+-- Solo lectura: el contenido de una sección, para mirarlo.
+create or replace function public.admin_read_section(pid uuid, section text)
+returns text language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return (select s.content from public.sections s where s.project_id = pid and s.name = section);
+end $$;
+
+create or replace function public.admin_project_presence(pid uuid)
+returns table (who text, screen text, detail text, updated_at timestamptz)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return query
+    select p.who, p.screen, p.detail, p.updated_at from public.presence p
+    where p.project_id = pid and p.updated_at > now() - interval '30 seconds' order by p.who;
+end $$;
+
+-- Los archivos de imágenes de un grupo, de un proyecto o de los grupos que quedarían vacíos si se borrara a una persona.
+create or replace function public.admin_images(gid uuid default null, pid uuid default null)
+returns table (group_id uuid, project_id uuid, hash text, ext text)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return query
+    select i.group_id, i.project_id, i.hash, i.ext from public.images i
+    where (gid is null or i.group_id = gid) and (pid is null or i.project_id = pid);
+end $$;
+
+create or replace function public.admin_user_orphans(uid uuid)
+returns table (group_id uuid, project_id uuid, hash text, ext text)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return query
+    select i.group_id, i.project_id, i.hash, i.ext from public.images i
+    where exists (select 1 from public.memberships m where m.group_id = i.group_id and m.user_id = uid)
+      and not exists (select 1 from public.memberships m where m.group_id = i.group_id and m.user_id <> uid);
+end $$;
+
+create or replace function public.admin_log_list(max_rows integer default 200)
+returns table (at timestamptz, admin_name text, action text, target text)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  return query select l.at, l.admin_name, l.action, l.target from public.admin_log l
+    order by l.id desc limit least(greatest(coalesce(max_rows, 200), 1), 1000);
+end $$;
+
+-- Quita a una persona de un grupo. Mismas reglas que `leave_group`: si queda alguien sin dueño, el más antiguo pasa a serlo; si
+-- no queda nadie, el grupo se borra.
+create or replace function public.admin_remove_member(gid uuid, uid uuid)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  perform 1 from public.groups g where g.id = gid for update;
+  delete from public.presence p
+    where p.user_id = uid and p.project_id in (select pr.id from public.projects pr where pr.group_id = gid);
+  delete from public.memberships m where m.group_id = gid and m.user_id = uid;
+  perform public.admin_note('quitar de un grupo', gid::text || ' / ' || uid::text);
+  if not exists (select 1 from public.memberships m where m.group_id = gid) then
+    delete from public.groups g where g.id = gid;
+  elsif not exists (select 1 from public.memberships m where m.group_id = gid and m.role = 'owner') then
+    update public.memberships m set role = 'owner'
+    where m.group_id = gid
+      and m.user_id = (select m2.user_id from public.memberships m2 where m2.group_id = gid order by m2.joined_at limit 1);
+  end if;
+end $$;
+
+create or replace function public.admin_set_role(gid uuid, uid uuid, new_role text)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  if new_role not in ('owner', 'member') then raise exception 'rol inválido' using errcode = '22023'; end if;
+  perform 1 from public.groups g where g.id = gid for update;
+  update public.memberships m set role = new_role where m.group_id = gid and m.user_id = uid;
+  if not found then raise exception 'no es miembro' using errcode = '22023'; end if;
+  if not exists (select 1 from public.memberships m where m.group_id = gid and m.role = 'owner') then
+    raise exception 'el grupo tiene que tener al menos un dueño' using errcode = '22023';
+  end if;
+  perform public.admin_note('cambiar rol', gid::text || ' / ' || uid::text || ' → ' || new_role);
+end $$;
+
+create or replace function public.admin_delete_group(gid uuid)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  perform public.admin_note('borrar grupo', coalesce((select g.name from public.groups g where g.id = gid), '') || ' ' || gid::text);
+  delete from public.groups g where g.id = gid;
+end $$;
+
+create or replace function public.admin_delete_project(pid uuid)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  perform public.admin_note('borrar proyecto', coalesce((select pr.name from public.projects pr where pr.id = pid), '') || ' ' || pid::text);
+  delete from public.projects pr where pr.id = pid;
+end $$;
+
+create or replace function public.admin_set_admin(uid uuid, make_admin boolean)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  if uid = auth.uid() and not make_admin then raise exception 'no podés quitarte el permiso a vos mismo' using errcode = '22023'; end if;
+  if make_admin then
+    insert into public.admins (user_id) values (uid) on conflict do nothing;
+  else
+    delete from public.admins a where a.user_id = uid;
+  end if;
+  perform public.admin_note(case when make_admin then 'dar permiso de administración' else 'quitar permiso de administración' end, uid::text);
+end $$;
+
+-- Borra una cuenta. Antes de que la fila de `auth.users` arrastre todo lo que "creó" (los grupos y proyectos con `created_by` se
+-- borrarían aunque tengan más gente), lo que sigue teniendo miembros pasa a otra persona del grupo. Los grupos donde era la única
+-- persona se borran con todo lo que tienen. Los archivos de esos grupos hay que borrarlos antes (ver `admin_user_orphans`).
+create or replace function public.admin_delete_user(uid uuid)
+returns void language plpgsql security definer set search_path = '' as $$
+declare
+  g record;
+  heir uuid;
+begin
+  if not public.is_admin() then raise exception 'no permitido' using errcode = '42501'; end if;
+  if uid = auth.uid() then raise exception 'no podés borrar tu propia cuenta desde acá' using errcode = '22023'; end if;
+  perform public.admin_note('borrar usuario', coalesce((select u.email::text from auth.users u where u.id = uid), '') || ' ' || uid::text);
+  for g in select m.group_id from public.memberships m where m.user_id = uid loop
+    perform 1 from public.groups x where x.id = g.group_id for update;
+    select m.user_id into heir from public.memberships m
+      where m.group_id = g.group_id and m.user_id <> uid order by (m.role = 'owner') desc, m.joined_at limit 1;
+    if heir is null then
+      delete from public.groups x where x.id = g.group_id;
+      continue;
+    end if;
+    if not exists (select 1 from public.memberships m where m.group_id = g.group_id and m.user_id <> uid and m.role = 'owner') then
+      update public.memberships m set role = 'owner' where m.group_id = g.group_id and m.user_id = heir;
+    end if;
+    update public.groups x set created_by = heir where x.id = g.group_id and x.created_by = uid;
+    update public.projects x set created_by = heir where x.group_id = g.group_id and x.created_by = uid;
+    update public.images x set uploaded_by = heir where x.group_id = g.group_id and x.uploaded_by = uid;
+    update public.invites x set created_by = heir where x.group_id = g.group_id and x.created_by = uid;
+  end loop;
+  delete from auth.users u where u.id = uid;
+end $$;
+
 -- Avisa que la persona está en un proyecto, con su nombre, la pantalla y un detalle (por ejemplo «escena 3»). Borra de paso lo
 -- que lleva más de un día sin renovarse.
 create or replace function public.set_presence(pid uuid, p_who text, p_screen text, p_detail text)
@@ -530,7 +763,12 @@ grant execute on function public.is_member(uuid), public.is_owner(uuid), public.
   public.reserve_image(uuid, text, text, bigint), public.release_image(uuid, text),
   public.my_name(), public.set_display_name(text),
   public.group_usage(uuid), public.admin_usage(), public.admin_set_quota(uuid, bigint),
-  public.set_presence(uuid, text, text, text), public.project_presence(uuid), public.project_stamp(uuid)
+  public.set_presence(uuid, text, text, text), public.project_presence(uuid), public.project_stamp(uuid),
+  public.admin_users(), public.admin_groups(), public.admin_group_members(uuid), public.admin_group_projects(uuid),
+  public.admin_project_sections(uuid), public.admin_read_section(uuid, text), public.admin_project_presence(uuid),
+  public.admin_images(uuid, uuid), public.admin_user_orphans(uuid), public.admin_log_list(integer),
+  public.admin_remove_member(uuid, uuid), public.admin_set_role(uuid, uuid, text), public.admin_delete_group(uuid),
+  public.admin_delete_project(uuid), public.admin_set_admin(uuid, boolean), public.admin_delete_user(uuid)
   to authenticated;
 
 -- El perfil se crea solo al registrarse.
@@ -586,6 +824,11 @@ create policy images_storage_delete on storage.objects for delete to authenticat
     and public.is_member(((storage.foldername(name))[1])::uuid)
   );
 
+-- Quien administra puede borrar archivos de cualquier grupo (al eliminar grupos, proyectos o cuentas).
+drop policy if exists images_storage_admin_delete on storage.objects;
+create policy images_storage_admin_delete on storage.objects for delete to authenticated
+  using (bucket_id = 'images' and public.is_admin());
+
 -- ------------------------------------------------------------------------------------------------
 -- Hacerse administrador (una sola vez, desde el SQL Editor, con TU usuario ya registrado):
 --
@@ -593,4 +836,5 @@ create policy images_storage_delete on storage.objects for delete to authenticat
 --
 -- Como administrador se pueden ver el uso de todos los grupos y cambiar sus cuotas desde el programa (Nube → Administración)
 -- o con:  select * from public.admin_usage();   select public.admin_set_quota('<id del grupo>', 104857600);
+-- El resto de la administración (usuarios, grupos, proyectos, registro) se hace con el programa aparte «Scriptpendra Admin».
 -- ------------------------------------------------------------------------------------------------

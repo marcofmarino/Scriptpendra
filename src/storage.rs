@@ -195,6 +195,8 @@ pub struct Settings {
     /// La nube (Supabase): su dirección y la clave pública. Ninguna es secreta; la clave secreta nunca se usa en el programa.
     pub cloud_url: String,
     pub cloud_anon_key: String,
+    /// Qué día (contado desde 1970) se buscaron actualizaciones por última vez.
+    pub last_update_check: u64,
     /// Nombres de personajes en negrita dentro del guion.
     pub bold_names: bool,
     /// Nombres de personajes en negrita dentro del tratamiento.
@@ -228,6 +230,7 @@ impl Default for Settings {
             user_id: 0,
             cloud_url: String::new(),
             cloud_anon_key: String::new(),
+            last_update_check: 0,
             bold_names: true,
             treatment_bold: false,
             show_timeline: true,
@@ -313,6 +316,15 @@ impl Settings {
                 .map_or(1, |d| d.as_nanos() as u64);
             settings.user_id = (nanos ^ u64::from(std::process::id()).rotate_left(17)) % 1_000_000 + 1;
             settings.save();
+        }
+        // La nube incorporada también se recuerda: si después se instala una copia sin nube (la de GitHub), sigue la misma.
+        if crate::cloud::has_built_in() {
+            let (url, key) = (crate::cloud::BUILT_IN_URL.trim(), crate::cloud::BUILT_IN_KEY.trim());
+            if settings.cloud_url != url || settings.cloud_anon_key != key {
+                settings.cloud_url = url.to_string();
+                settings.cloud_anon_key = key.to_string();
+                settings.save();
+            }
         }
         settings
     }

@@ -44,6 +44,7 @@ mod techscript;
 mod theme;
 mod treatment;
 mod ui;
+mod update;
 mod vcard;
 mod widgets;
 

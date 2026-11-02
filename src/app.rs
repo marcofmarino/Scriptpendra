@@ -499,11 +499,17 @@ pub struct ScriptApp {
     panel_trace: Vec<(&'static str, f32)>,
     /// Firma de las imágenes ya revisadas: solo se vuelve a copiar cuando cambia.
     image_sig: u64,
+    /// La versión nueva de la que ya se avisó en la barra de estado.
+    announced_update: Option<String>,
 }
 
 impl ScriptApp {
     pub fn new(ctx: &egui::Context) -> Self {
-        let settings = Settings::load();
+        let mut settings = Settings::load();
+        crate::update::init(ctx);
+        if crate::update::auto_check(&mut settings.last_update_check) {
+            settings.save();
+        }
         theme::install_fonts(ctx);
         egui_extras::install_image_loaders(ctx);
         theme::apply(ctx, &settings.scheme.palette(), settings.ui_zoom);
@@ -587,6 +593,7 @@ impl ScriptApp {
             #[cfg(test)]
             panel_trace: Vec::new(),
             image_sig: 0,
+            announced_update: None,
         }
     }
 
@@ -3827,6 +3834,12 @@ impl ScriptApp {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.project.sync_scene_numbers();
+        if let crate::update::State::Available(release) = crate::update::state()
+            && self.announced_update.as_deref() != Some(release.version.as_str())
+        {
+            self.status = format!("Hay una versión nueva ({}): instalala desde Ajustes → Actualizaciones.", release.version);
+            self.announced_update = Some(release.version);
+        }
         // Todo lo que se pega, en cualquier campo, llega limpio.
         ctx.input_mut(|i| {
             for event in &mut i.events {

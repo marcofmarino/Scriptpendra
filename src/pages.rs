@@ -2781,7 +2781,7 @@ fn scheme_row(ui: &mut Ui, p: &Palette, scheme: Scheme, selected: bool) -> egui:
 
 /// Devuelve si cambió algún ajuste.
 /// Las secciones de Ajustes (interfaz.md §7).
-pub const SETTINGS_SECTIONS: [&str; 5] = ["Apariencia", "Guion", "Producción", "Cámaras", "Agenda"];
+pub const SETTINGS_SECTIONS: [&str; 6] = ["Apariencia", "Guion", "Producción", "Cámaras", "Agenda", "Actualizaciones"];
 
 /// Ancho de la lista de secciones de Ajustes.
 const SETTINGS_NAV_W: f32 = 180.0;
@@ -2932,7 +2932,7 @@ pub fn settings(
                         project_changed |= crate::blocking::bodies_editor(ui, p, project);
                     }
                 }
-                _ => {
+                4 => {
                     kit::section(ui, p, "Agenda de contactos", None);
                     let mut agenda = crate::storage::load_agenda();
                     if agenda.is_empty() {
@@ -2957,10 +2957,71 @@ pub fn settings(
                         crate::storage::save_agenda(&agenda);
                     }
                 }
+                _ => update_section(ui, p),
             });
         });
     });
     (changed, project_changed)
+}
+
+/// Ajustes → Actualizaciones: la versión instalada, buscar una nueva y bajarla (ver `update`).
+fn update_section(ui: &mut Ui, p: &Palette) {
+    use crate::{ui::kit, update};
+    kit::section(ui, p, "Versión", None);
+    kit::prop_row(ui, p, "Instalada", |ui| {
+        ui.label(update::CURRENT);
+    });
+    let note = |ui: &mut Ui, text: &str, color: Color32| {
+        ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
+    };
+    let state = update::state();
+    ui.add_space(tokens::SP_S);
+    match &state {
+        update::State::Checking => note(ui, "Buscando…", p.dim),
+        update::State::Downloading { done, total } => {
+            let fraction = if *total > 0 { (*done as f32 / *total as f32).clamp(0.0, 1.0) } else { 0.0 };
+            ui.add(egui::ProgressBar::new(fraction).text(format!("Bajando la versión nueva… {} %", (fraction * 100.0) as u32)));
+        }
+        update::State::Available(release) => {
+            note(ui, &format!("Hay una versión nueva: {}", release.version), p.text);
+            let label = if cfg!(windows) { "Bajar e instalar" } else { "Bajar el instalador" };
+            if kit::primary_button(ui, p, label, None).clicked() {
+                update::install();
+            }
+        }
+        update::State::Installed => note(
+            ui,
+            "Listo. La versión nueva se abre la próxima vez que inicies el programa: guardá tu trabajo, cerralo y volvé a abrirlo.",
+            p.text,
+        ),
+        update::State::Saved(path) => note(
+            ui,
+            &format!(
+                "El instalador quedó en {}. Si no se abrió solo, abrilo desde tu gestor de archivos para instalarlo y después reiniciá el programa.",
+                path.display()
+            ),
+            p.text,
+        ),
+        update::State::UpToDate => note(ui, "Tenés la última versión.", p.dim),
+        update::State::Failed(why) => note(ui, why, p.danger),
+        update::State::Idle => {}
+    }
+    let busy = matches!(state, update::State::Checking | update::State::Downloading { .. });
+    if !busy
+        && !matches!(state, update::State::Available(_))
+        && ui.button("Buscar actualizaciones").clicked()
+    {
+        update::check();
+    }
+    ui.add_space(tokens::SP_S);
+    ui.add(
+        egui::Label::new(
+            RichText::new("Las versiones se publican en github.com/marcofmarino/Scriptpendra. Solo se instala un archivo cuya huella coincide con la publicada.")
+                .size(tokens::FONT_SMALL)
+                .color(p.dim),
+        )
+        .wrap(),
+    );
 }
 
 pub enum HomeAction {

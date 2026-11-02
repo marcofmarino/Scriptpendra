@@ -236,6 +236,80 @@ begin
   perform pg_temp.must_equal('y su presencia', (select count(*) from public.presence where project_id = pc), 0::bigint);
 end $$;
 
+-- Administración: solo mira (no edita ni informa presencia) y elimina ------------------------------------------------------
+select pg_temp.as_admin_db();
+insert into auth.users (id, instance_id, aud, role, email)
+values ('00000000-0000-0000-0000-0000000000c3', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'c@test.invalid'),
+       ('00000000-0000-0000-0000-0000000000d4', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'd@test.invalid');
+insert into public.admins (user_id) values ('00000000-0000-0000-0000-0000000000c3');
+
+do $$
+declare
+  a uuid := '00000000-0000-0000-0000-0000000000a1';
+  b uuid := '00000000-0000-0000-0000-0000000000b2';
+  c uuid := '00000000-0000-0000-0000-0000000000c3';
+  d uuid := '00000000-0000-0000-0000-0000000000d4';
+  gs uuid; gd uuid; ps uuid; code text; v bigint;
+begin
+  perform pg_temp.as_user(a);
+  gs := public.create_group('Compartido');
+  ps := public.create_project(gs, 'Corto compartido');
+  v := public.push_section(ps, 'guion', 0, '{"paragraphs":[{"id":1,"kind":"Action","text":"Hola"}]}');
+  code := public.create_invite(gs);
+  perform pg_temp.as_user(b);
+  perform public.join_group(code);
+  perform pg_temp.as_user(d);
+  gd := public.create_group('Solo de D');
+  perform public.create_project(gd, 'Corto de D');
+
+  -- Quien no administra no puede usar nada de esto.
+  perform pg_temp.as_user(a);
+  perform pg_temp.must_fail('una persona común no ve la lista de usuarios', 'select * from public.admin_users()', 'no permitido');
+  perform pg_temp.must_fail('ni lee secciones', format('select public.admin_read_section(%L, ''guion'')', ps), 'no permitido');
+  perform pg_temp.must_fail('ni borra grupos', format('select public.admin_delete_group(%L)', gs), 'no permitido');
+  perform pg_temp.must_fail('ni se da permiso', format('select public.admin_set_admin(%L, true)', a), 'no permitido');
+  perform pg_temp.as_anon();
+  perform pg_temp.must_fail('sin sesión tampoco', 'select * from public.admin_users()', 'permission denied');
+
+  -- Quien administra mira sin ser miembro.
+  perform pg_temp.as_user(c);
+  perform pg_temp.must_equal('ve a todas las personas', (select count(*) >= 4 from public.admin_users()), true);
+  perform pg_temp.must_equal('ve el grupo', (select count(*) from public.admin_groups() where group_id = gs), 1::bigint);
+  perform pg_temp.must_equal('ve a los miembros', (select count(*) from public.admin_group_members(gs)), 2::bigint);
+  perform pg_temp.must_equal('lee el contenido de una sección', public.admin_read_section(ps, 'guion') like '%Hola%', true);
+  perform pg_temp.must_equal('no es miembro del grupo', public.is_member(gs), false);
+  -- Y no edita ni informa presencia.
+  perform pg_temp.must_fail('no puede subir una sección', format('select public.push_section(%L, ''guion'', 1, ''{}'')', ps), 'no permitido');
+  perform pg_temp.must_fail('no informa presencia', format('select public.set_presence(%L, ''x'', ''Guion'', '''')', ps), 'no permitido');
+  perform pg_temp.must_fail('no puede quitarse el permiso a sí mismo', format('select public.admin_set_admin(%L, false)', c), 'vos mismo');
+  perform pg_temp.must_fail('no puede borrar su cuenta desde el programa', format('select public.admin_delete_user(%L)', c), 'propia cuenta');
+  perform pg_temp.must_fail('un grupo no se queda sin dueño', format('select public.admin_set_role(%L, %L, ''member'')', gs, a), 'al menos un dueño');
+
+  -- Eliminar a quien creó un grupo compartido no se lleva el grupo.
+  perform public.admin_delete_user(a);
+  perform pg_temp.as_admin_db();
+  perform pg_temp.must_equal('el grupo compartido sigue', (select count(*) from public.groups where id = gs), 1::bigint);
+  perform pg_temp.must_equal('y su proyecto', (select count(*) from public.projects where id = ps), 1::bigint);
+  perform pg_temp.must_equal('y el otro miembro pasó a ser dueño', (select role from public.memberships where group_id = gs and user_id = b), 'owner');
+  perform pg_temp.must_equal('el proyecto quedó a nombre de quien sigue', (select created_by from public.projects where id = ps), b);
+  perform pg_temp.must_equal('la cuenta ya no existe', (select count(*) from auth.users where id = a), 0::bigint);
+
+  -- Eliminar a la única persona de un grupo borra el grupo con todo.
+  perform pg_temp.as_user(c);
+  perform public.admin_delete_user(d);
+  perform pg_temp.as_admin_db();
+  perform pg_temp.must_equal('el grupo de una sola persona se borra', (select count(*) from public.groups where id = gd), 0::bigint);
+
+  -- Cada cambio queda en el registro.
+  perform pg_temp.as_user(c);
+  perform pg_temp.must_equal('el registro anota lo hecho', (select count(*) >= 2 from public.admin_log_list(50)), true);
+  perform pg_temp.must_equal('y quién lo hizo', (select count(*) from public.admin_log_list(50) where action = 'borrar usuario'), 2::bigint);
+  perform public.admin_delete_project(ps);
+  perform public.admin_delete_group(gs);
+  perform pg_temp.as_admin_db();
+  perform pg_temp.must_equal('borrar el grupo borra el resto', (select count(*) from public.sections where project_id = ps), 0::bigint);
+end $$;
+
 reset role;
 do $$ begin raise notice 'TODAS LAS PRUEBAS PASARON'; end $$;
 rollback;
