@@ -2974,6 +2974,11 @@ fn update_section(ui: &mut Ui, p: &Palette) {
     let note = |ui: &mut Ui, text: &str, color: Color32| {
         ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
     };
+    if update::managed_by_store() {
+        ui.add_space(tokens::SP_S);
+        note(ui, "Este programa se actualiza desde tu tienda de aplicaciones (o con «flatpak update»): no hace falta hacer nada acá.", p.dim);
+        return;
+    }
     let state = update::state();
     ui.add_space(tokens::SP_S);
     match &state {

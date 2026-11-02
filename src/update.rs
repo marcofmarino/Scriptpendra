@@ -60,6 +60,27 @@ pub enum State {
     Failed(String),
 }
 
+/// ¿El programa es un Flatpak instalado desde un repositorio (ver `scripts/publicar-flatpak.sh`)? Entonces lo actualiza la
+/// tienda de aplicaciones o `flatpak update`, y el programa no busca ni baja nada. Un Flatpak instalado desde un archivo suelto
+/// queda con un remoto llamado «…-origin»: ese sí se actualiza con el actualizador.
+pub fn managed_by_store() -> bool {
+    fs::read_to_string("/.flatpak-info").ok().and_then(|info| origin_of(&info)).is_some_and(|origin| !origin.ends_with("-origin"))
+}
+
+/// De qué remoto se instaló, según el `/.flatpak-info` que Flatpak pone dentro de cada aplicación.
+fn origin_of(info: &str) -> Option<String> {
+    let mut in_instance = false;
+    for line in info.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_instance = line == "[Instance]";
+        } else if in_instance && let Some(value) = line.strip_prefix("origin=") {
+            return Some(value.trim().to_string()).filter(|v| !v.is_empty());
+        }
+    }
+    None
+}
+
 static STATE: Mutex<State> = Mutex::new(State::Idle);
 static CTX: Mutex<Option<eframe::egui::Context>> = Mutex::new(None);
 
@@ -89,7 +110,7 @@ pub fn init(ctx: &eframe::egui::Context) {
 
 /// Busca solo, a lo sumo una vez por día. Devuelve `true` si cambió el día de la última búsqueda (hay que guardar los ajustes).
 pub fn auto_check(last_check: &mut u64) -> bool {
-    if cfg!(test) {
+    if cfg!(test) || managed_by_store() {
         return false;
     }
     let today = std::time::SystemTime::now()
@@ -105,7 +126,7 @@ pub fn auto_check(last_check: &mut u64) -> bool {
 
 /// Busca la última versión publicada (en un hilo aparte).
 pub fn check() {
-    if matches!(state(), State::Checking | State::Downloading { .. }) {
+    if managed_by_store() || matches!(state(), State::Checking | State::Downloading { .. }) {
         return;
     }
     set(State::Checking);
@@ -392,6 +413,15 @@ mod tests {
         let found = latest();
         println!("{found:?}");
         assert!(found.is_ok());
+    }
+
+    #[test]
+    fn the_origin_of_a_flatpak_tells_a_repository_from_a_loose_file() {
+        let info = "[Application]\nname=io.github.x\n\n[Instance]\ninstance-id=1\norigin=scriptpendra\n";
+        assert_eq!(origin_of(info).as_deref(), Some("scriptpendra"));
+        assert_eq!(origin_of("[Instance]\ninstance-id=1\n"), None);
+        // Solo vale el grupo [Instance].
+        assert_eq!(origin_of("[Other]\norigin=flathub\n"), None);
     }
 
     #[test]
