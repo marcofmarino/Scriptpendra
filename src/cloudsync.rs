@@ -330,7 +330,7 @@ pub fn download_project<T: Transport>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cloud::{Method, Request, Response};
     use serde_json::{Value, json};
@@ -343,15 +343,15 @@ mod tests {
 
     /// Un servidor de Supabase de juguete: las secciones de un proyecto con su versión, igual que `push_section` del SQL.
     #[derive(Default)]
-    struct Server {
-        sections: BTreeMap<String, (String, i64)>,
+    pub(crate) struct Server {
+        pub(crate) sections: BTreeMap<String, (String, i64)>,
         who: BTreeMap<String, String>,
         /// Los caminos que se pidieron, para comprobar cuánto se habla con el servidor.
         calls: Vec<String>,
     }
 
     #[derive(Clone)]
-    struct Fake(Arc<Mutex<Server>>);
+    pub(crate) struct Fake(Arc<Mutex<Server>>);
 
     impl Transport for Fake {
         fn send(&self, r: &Request) -> Result<Response, CloudError> {
@@ -403,20 +403,20 @@ mod tests {
         }
     }
 
-    fn person(server: &Arc<Mutex<Server>>) -> Client<Fake> {
+    pub(crate) fn person(server: &Arc<Mutex<Server>>) -> Client<Fake> {
         let mut client = Client::new("https://abc.supabase.co".into(), KEY, Fake(server.clone())).unwrap();
         client.sign_in("a@b.co", "una-clave-larga").unwrap();
         client
     }
 
-    fn folder_for(name: &str) -> PathBuf {
+    pub(crate) fn folder_for(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("scriptpendra-cloud-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir.join("Corto.scriptpendra")
     }
 
-    fn link() -> CloudLink {
+    pub(crate) fn link() -> CloudLink {
         CloudLink {
             url: "https://abc.supabase.co".into(),
             group: GROUP.into(),

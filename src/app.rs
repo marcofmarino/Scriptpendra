@@ -5493,6 +5493,55 @@ mod tests {
         std::fs::write(path, text.replace(from, to)).unwrap();
     }
 
+    /// Dos personas editan a la vez y después no tocan nada: la sincronización tiene que quedarse quieta (sin subir ni chocar para siempre).
+    #[test]
+    fn two_people_editing_at_once_settle_and_stop_pushing() {
+        use crate::cloudsync::tests::{Server, folder_for, link, person};
+        use std::sync::{Arc, Mutex};
+        let server = Arc::new(Mutex::new(Server::default()));
+        let (mut a, file_a) = shared_project("sim-a");
+        let (mut client_a, mut link_a) = (person(&server), link());
+        crate::cloudsync::sync_once(&mut client_a, &file_a, &mut link_a, "Ana").unwrap();
+        a.cloud_link = Some(link_a.clone());
+        let file_b = folder_for("sim-b");
+        let (mut client_b, mut link_b) = (person(&server), link());
+        crate::cloudsync::sync_once(&mut client_b, &file_b, &mut link_b, "Luis").unwrap();
+        folder::save(&folder::join(&folder::read_sections(&file_b).unwrap()).unwrap(), &file_b).unwrap();
+        let mut b = ScriptApp::new(&egui::Context::default());
+        b.settings.user_id = a.settings.user_id.wrapping_add(7);
+        b.start_project(folder::load(&file_b).unwrap(), Some(file_b.clone()));
+        b.cloud_link = Some(link_b.clone());
+        // Los dos escriben a la vez.
+        let pa = a.project.make_paragraph(crate::model::ParagraphKind::Action, "Línea de Ana.");
+        a.project.paragraphs.push(pa);
+        a.dirty = true;
+        let pb = b.project.make_paragraph(crate::model::ParagraphKind::Action, "Línea de Luis.");
+        b.project.paragraphs.push(pb);
+        b.dirty = true;
+        let mut log = Vec::new();
+        for round in 0..30 {
+            for (app, client, who) in [(&mut a, &mut client_a, "Ana"), (&mut b, &mut client_b, "Luis")] {
+                if app.dirty {
+                    app.save(false);
+                }
+                let mut l = app.cloud_link.clone().unwrap();
+                let report = crate::cloudsync::sync_once(client, app.path.as_ref().unwrap(), &mut l, who).unwrap();
+                app.cloud_link = Some(l);
+                if !report.pulled.is_empty() || !report.merged.is_empty() || !report.conflicts.is_empty() {
+                    app.poll_external(true);
+                    if app.dirty && app.conflicts.is_empty() {
+                        app.save(false);
+                    }
+                }
+                log.push((round, who, report.pushed.len(), report.retry));
+            }
+        }
+        let late: Vec<_> = log.iter().filter(|(r, ..)| *r >= 15).filter(|(_, _, p, retry)| *p > 0 || *retry).collect();
+        assert!(late.is_empty(), "siguen subiendo o chocando tras 15 rondas: {late:?}\nlog completo: {log:?}");
+        let texts: Vec<String> = a.project.paragraphs.iter().map(|p| p.text.clone()).collect();
+        assert!(texts.iter().any(|t| t == "Línea de Ana.") && texts.iter().any(|t| t == "Línea de Luis."), "{texts:?}");
+    }
+
     #[test]
     fn a_change_saved_by_someone_else_is_brought_in_and_untouched_local_work_is_kept() {
         let (mut app, file) = shared_project("pull");

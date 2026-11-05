@@ -110,6 +110,8 @@ enum Event {
     Usage(String, i64, i64, i64),
     Images(ImageResult),
     Peers(Vec<cloud::Peer>),
+    /// La presencia falló (sin permiso, sin red…): se espera más antes de volver a probar.
+    PresenceFailed,
     /// El nombre que tiene la persona en el servidor (`None`: todavía no eligió).
     Name(Option<String>),
     Error(String),
@@ -208,8 +210,10 @@ fn run(client: &mut Client<HttpsTransport>, job: Job) -> Event {
         Job::SetName(name) => client.set_display_name(&name).map(|n| Event::Name(Some(n))).unwrap_or_else(fail),
         Job::Presence { project, who, screen, detail } => {
             // Avisar que estoy y ver quién más está: si falla no es importante, no se muestra como error.
-            let _ = client.set_presence(&project, &who, &screen, &detail);
-            Event::Peers(client.presence(&project).unwrap_or_default())
+            match client.set_presence(&project, &who, &screen, &detail).and_then(|()| client.presence(&project)) {
+                Ok(peers) => Event::Peers(peers),
+                Err(_) => Event::PresenceFailed,
+            }
         }
         Job::Usage(group) => client
             .group_usage(&group)
@@ -293,6 +297,8 @@ pub struct CloudUi {
     syncing: bool,
     images_busy: bool,
     presence_busy: bool,
+    /// Fallos seguidos de la presencia: cada uno duplica la espera.
+    presence_errors: u32,
     last_presence: f64,
     /// Los proyectos de todos mis grupos: (id, nombre, id del grupo).
     catalog: Vec<(String, String, String)>,
@@ -512,18 +518,32 @@ impl CloudUi {
                     if !report.conflicts.is_empty() {
                         out.message = Some("Alguien cambió lo mismo que vos: se guardó tu versión aparte en la carpeta del proyecto.".into());
                     }
-                    // Si alguien se adelantó al subir, se vuelve a empezar enseguida.
-                    // Con un tope: si el conflicto no se resuelve, se sigue al ritmo normal en vez de insistir cada segundo.
-                    if report.retry && self.retries < 3 {
-                        self.retries += 1;
-                        self.last_sync = 0.0;
-                    } else if !report.retry {
+                    // Si alguien se adelantó al subir, se vuelve a empezar enseguida (1 s, 2 s, 3 s). Si el choque sigue, cada
+                    // ronda de más duplica la espera: un conflicto que no se resuelve no puede martillar al servidor para siempre.
+                    if report.retry {
+                        self.retries = (self.retries + 1).min(12);
+                        if self.retries <= 3 {
+                            self.last_sync = now - self.sync_wait(fast) + f64::from(self.retries);
+                        } else {
+                            self.sync_errors = (self.retries - 3).min(6);
+                            if self.retries == 4 {
+                                out.message = Some(
+                                    "La sincronización sigue chocando con otra persona. Revisá que todos tengan la misma versión del programa.".into(),
+                                );
+                            }
+                        }
+                    } else {
                         self.retries = 0;
                     }
                     out.link = Some(new_link);
                 }
+                Event::PresenceFailed => {
+                    self.presence_busy = false;
+                    self.presence_errors = (self.presence_errors + 1).min(6);
+                }
                 Event::Peers(peers) => {
                     self.presence_busy = false;
+                    self.presence_errors = 0;
                     out.peers = Some(peers);
                 }
                 Event::Usage(group, used, quota, count) => {
@@ -674,7 +694,7 @@ impl CloudUi {
             return;
         };
         // Con la sincronización fallando no se insiste con la presencia.
-        if self.presence_busy || self.sync_errors > 0 || now - self.last_presence < PRESENCE_SECS {
+        if self.presence_busy || self.sync_errors > 0 || now - self.last_presence < (PRESENCE_SECS * f64::from(1u32 << self.presence_errors)).min(SYNC_MAX_SECS) {
             return;
         }
         self.last_presence = now;
