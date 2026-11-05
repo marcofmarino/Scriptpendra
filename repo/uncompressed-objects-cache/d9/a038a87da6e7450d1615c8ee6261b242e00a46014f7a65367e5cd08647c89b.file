@@ -1,0 +1,59 @@
+{
+  "id" : "io.github.marcofmarino.Scriptpendra",
+  "runtime" : "org.freedesktop.Platform",
+  "runtime-version" : "26.08",
+  "runtime-commit" : "df26daaf9d07610b4a72cc4585566194051275ac68396597b06474396f66427c",
+  "sdk" : "org.freedesktop.Sdk",
+  "sdk-commit" : "a1b744b072d9f55d061e35382547ae80dad8d92abecc1da7dc1818de2daabfd3",
+  "command" : "scriptpendra",
+  "modules" : [
+    {
+      "name" : "scriptpendra",
+      "buildsystem" : "simple",
+      "sources" : [
+        {
+          "path" : "..",
+          "skip" : [
+            "target",
+            "build-flatpak",
+            ".flatpak-builder",
+            ".git",
+            ".codegraph",
+            ".claude",
+            "docs"
+          ],
+          "type" : "dir"
+        }
+      ],
+      "build-options" : {
+        "env" : {
+          "CARGO_HOME" : "/run/build/scriptpendra/cargo"
+        },
+        "build-args" : [
+          "--share=network"
+        ],
+        "append-path" : "/usr/lib/sdk/rust-stable/bin"
+      },
+      "build-commands" : [
+        "cargo build --release --locked",
+        "install -Dm755 target/release/Scriptpendra /app/bin/scriptpendra",
+        "install -Dm644 flatpak/io.github.marcofmarino.Scriptpendra.desktop /app/share/applications/io.github.marcofmarino.Scriptpendra.desktop",
+        "install -Dm644 flatpak/io.github.marcofmarino.Scriptpendra.metainfo.xml /app/share/metainfo/io.github.marcofmarino.Scriptpendra.metainfo.xml",
+        "install -Dm644 flatpak/io.github.marcofmarino.Scriptpendra.svg /app/share/icons/hicolor/scalable/apps/io.github.marcofmarino.Scriptpendra.svg"
+      ]
+    }
+  ],
+  "sdk-extensions" : [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
+  "finish-args" : [
+    "--share=network",
+    "--share=ipc",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--device=dri",
+    "--filesystem=home",
+    "--talk-name=org.freedesktop.secrets"
+  ],
+  "source-date-epoch" : 1793496354
+}

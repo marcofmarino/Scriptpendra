@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Scriptpendra
+Comment=Guion, preproducción y producción de cortometrajes
+Comment[en]=Screenwriting, preproduction and production for short films
+Exec=scriptpendra %f
+Icon=io.github.marcofmarino.Scriptpendra
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=guion;cine;cortometraje;screenplay;film;
+StartupWMClass=io.github.marcofmarino.Scriptpendra

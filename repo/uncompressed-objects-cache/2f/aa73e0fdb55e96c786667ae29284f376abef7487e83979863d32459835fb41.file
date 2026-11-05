@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.marcofmarino.Scriptpendra</id>
+  <name>Scriptpendra</name>
+  <summary>Guion, preproducción y producción de cortometrajes</summary>
+  <developer id="io.github.marcofmarino">
+    <name>Marco Marino</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <url type="homepage">https://github.com/marcofmarino/Scriptpendra</url>
+  <description>
+    <p>Aplicación para llevar adelante proyectos de cortometrajes universitarios: escritura del guion, preproducción y producción.</p>
+  </description>
+  <launchable type="desktop-id">io.github.marcofmarino.Scriptpendra.desktop</launchable>
+  <content_rating type="oars-1.1" />
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <releases>
+    <release version="0.1.0" date="2026-10-31" />
+  </releases>
+</component>

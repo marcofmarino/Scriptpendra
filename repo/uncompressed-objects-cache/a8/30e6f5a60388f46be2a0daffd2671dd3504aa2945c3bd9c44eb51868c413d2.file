@@ -1,0 +1,22 @@
+[Application]
+name=io.github.marcofmarino.Scriptpendra
+runtime=org.freedesktop.Platform/x86_64/26.08
+sdk=org.freedesktop.Sdk/x86_64/26.08
+command=scriptpendra
+
+[Context]
+shared=ipc;network;
+sockets=fallback-x11;wayland;
+devices=dri;
+filesystems=home;
+
+[Session Bus Policy]
+org.freedesktop.secrets=talk
+
+[Extension io.github.marcofmarino.Scriptpendra.Debug]
+directory=lib/debug
+autodelete=true
+no-autodownload=true
+
+[Build]
+built-extensions=io.github.marcofmarino.Scriptpendra.Debug;
